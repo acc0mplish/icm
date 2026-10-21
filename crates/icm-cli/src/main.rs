@@ -10,6 +10,7 @@ mod bench_format;
 mod bench_knowledge;
 
 mod config;
+mod conversation;
 mod extract;
 mod extract_semantic;
 // Force-directed layout for the memory-relationship graph view: the TUI's
@@ -3086,9 +3087,17 @@ fn main() -> Result<()> {
                     let emb_ref = embedder.as_ref().map(|e| e as &dyn icm_core::Embedder);
                     #[cfg(not(feature = "embeddings"))]
                     let emb_ref: Option<&dyn icm_core::Embedder> = None;
-                    cmd_hook_compact(&store, emb_ref, &cfg.memory, &cfg.consolidate)
+                    cmd_hook_compact(
+                        &store,
+                        emb_ref,
+                        &cfg.memory,
+                        &cfg.consolidate,
+                        &cfg.extraction,
+                    )
                 }
-                HookCommands::Prompt => cmd_hook_prompt(&store, &cfg.archive),
+                HookCommands::Prompt => {
+                    cmd_hook_prompt(&store, &cfg.archive, &cfg.recall, &cfg.extraction)
+                }
                 HookCommands::Start { max_tokens } => {
                     let tokens = if max_tokens > 0 {
                         max_tokens
@@ -3107,7 +3116,7 @@ fn main() -> Result<()> {
                         emb_ref,
                         &cfg.memory,
                         &cfg.consolidate,
-                        &cfg.extraction.summarizer,
+                        &cfg.extraction,
                     )
                 }
                 // Dispatched before `open_store`; this arm only exists for
@@ -3520,30 +3529,49 @@ fn render_recall_v2(
     // part in the ranking (a keyword-only ranking has no similarity to
     // report), and a blank query finds nothing instead of failing.
     let with_score = embedder.is_some();
-    let results: Vec<(Memory, Option<f32>)> = if request.query.trim().is_empty() {
-        Vec::new()
-    } else {
-        // The budget is spent on what `format` prints: its header once,
-        // then each memory as rendered.
-        let mut request = *request;
-        request.max_tokens = request
-            .max_tokens
-            .map(|budget| budget.saturating_sub(recall_header_tokens(with_score, format)));
-        let outcome = request.run_with_cost(store, embedder, &|memory, score| {
-            rendered_recall_tokens(memory, with_score.then_some(score), format)
-        })?;
-        outcome
-            .hits
-            .into_iter()
-            .map(|hit| (hit.memory, with_score.then_some(hit.score)))
-            .collect()
-    };
+    let (results, raw): (Vec<(Memory, Option<f32>)>, Vec<icm_core::RawRelevance>) =
+        if request.query.trim().is_empty() {
+            (Vec::new(), Vec::new())
+        } else {
+            // The budget is spent on what `format` prints: its header once,
+            // then each memory as rendered.
+            let mut request = *request;
+            request.max_tokens = request
+                .max_tokens
+                .map(|budget| budget.saturating_sub(recall_header_tokens(with_score, format)));
+            let outcome = request.run_with_cost(store, embedder, &|memory, score, raw| {
+                rendered_recall_tokens_raw(memory, with_score.then_some(score), raw, format)
+            })?;
+            outcome
+                .hits
+                .into_iter()
+                .map(|hit| ((hit.memory, with_score.then_some(hit.score)), hit.raw))
+                .unzip()
+        };
     // The detail renderer has no representation for "nothing": keep the
     // human banner there, like the legacy path (audit #185 H8).
     if results.is_empty() && matches!(format, recall_format::RecallFormat::Detail) {
         return Ok(format!("{MSG_NO_MEMORIES}\n"));
     }
-    recall_format::render(&results, format)
+    recall_format::render_with_raw(&results, &raw, format)
+}
+
+/// [`rendered_recall_tokens`] with the raw relevance the JSON format shows
+/// beside the score.
+fn rendered_recall_tokens_raw(
+    memory: &Memory,
+    score: Option<f32>,
+    raw: &icm_core::RawRelevance,
+    format: recall_format::RecallFormat,
+) -> usize {
+    if !matches!(format, recall_format::RecallFormat::Json) || raw.is_empty() {
+        return rendered_recall_tokens(memory, score, format);
+    }
+    let one = [(memory.clone(), score)];
+    match recall_format::render_with_raw(&one, std::slice::from_ref(raw), format) {
+        Ok(body) => icm_core::estimate_tokens(&body),
+        Err(_) => usize::MAX,
+    }
 }
 
 /// Estimated tokens one recalled memory takes once rendered in `format`,
@@ -4600,8 +4628,112 @@ fn cmd_hook_compact(
     embedder: Option<&dyn icm_core::Embedder>,
     memory_cfg: &crate::config::MemoryConfig,
     consolidate_cfg: &crate::config::ConsolidateConfig,
+    extraction_cfg: &crate::config::ExtractionConfig,
 ) -> Result<()> {
-    extract_from_hook_transcript(store, embedder, memory_cfg, consolidate_cfg, "pre-compact")
+    let Some(input) = read_stdin_utf8_lossy() else {
+        return Ok(());
+    };
+    // Same reentrancy guard as SessionEnd (#322): a worker's own compaction
+    // must not enqueue and fork again. Once the conversation is queued for
+    // the LLM, the keyword pass over the same transcript is skipped, as on
+    // SessionEnd's async path: it would store the assistant's last messages
+    // a second time, raw.
+    if extraction_cfg.conversation.enabled
+        && std::env::var_os("ICM_WORKER").is_none()
+        && extraction_cfg.enabled
+        && extraction_cfg.summarizer.provider != "none"
+    {
+        if enqueue_conversation(store, &input, extraction_cfg, "pre-compact", true) > 0 {
+            spawn_detached_worker(&["extract-pending", "--limit", "20"], "extraction");
+        }
+        return Ok(());
+    }
+    extract_from_hook_transcript(
+        store,
+        embedder,
+        memory_cfg,
+        consolidate_cfg,
+        "pre-compact",
+        &input,
+    )
+}
+
+/// Enqueue the part of the hook's transcript not yet enqueued as
+/// conversation excerpts for `extract-pending` (see `conversation`), and
+/// record how far it went for this session. Returns the excerpts enqueued.
+///
+/// `flush` (PreCompact, SessionEnd) queues everything up to the end of the
+/// transcript; without it (UserPromptSubmit) only full excerpts are queued
+/// and the rest is read again next time (see [`conversation::batch`]).
+///
+/// Nothing happens when extraction is disabled or has no LLM provider: the
+/// fastembed fallback is not meant for whole conversation excerpts. Errors
+/// are logged, never propagated: a hook must not fail the session.
+fn enqueue_conversation(
+    store: &Store,
+    input: &str,
+    extraction_cfg: &crate::config::ExtractionConfig,
+    source: &str,
+    flush: bool,
+) -> usize {
+    if !extraction_cfg.enabled || extraction_cfg.summarizer.provider == "none" {
+        return 0;
+    }
+    let Ok(json) = serde_json::from_str::<Value>(input) else {
+        return 0;
+    };
+    let Some(path) = json.get("transcript_path").and_then(|v| v.as_str()) else {
+        return 0;
+    };
+    let session = json
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or(path);
+    let key = conversation::position_key(session);
+    let done = store
+        .get_metadata_str(&key)
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    // From the recorded byte offset, not from the start: a long session's
+    // transcript outgrows any whole-file cap.
+    let Ok((text, start, read_end)) =
+        conversation::read_new_lines(path, done, MAX_TRANSCRIPT_BYTES)
+    else {
+        return 0;
+    };
+    // A line longer than the read cap comes back as no text: skip past it.
+    let limits = extraction_cfg.conversation.limits();
+    let mut batch = conversation::batch(&text, start, flush, &limits);
+    if text.is_empty() {
+        batch.end = read_end;
+    }
+
+    let project = project_from_cwd_json(&json).unwrap_or_else(|| "project".to_string());
+    let mut enqueued = 0;
+    for excerpt in &batch.excerpts {
+        match store.enqueue_pending_extraction(
+            &project,
+            conversation::CONVERSATION_ROW_TOOL,
+            excerpt,
+        ) {
+            Ok(_) => enqueued += 1,
+            Err(e) => {
+                eprintln!("[icm] {source}: conversation enqueue failed: {e}");
+                return enqueued;
+            }
+        }
+    }
+    if batch.end != done
+        && let Err(e) = store.set_metadata_str(&key, &batch.end.to_string())
+    {
+        eprintln!("[icm] {source}: conversation position not saved: {e}");
+    }
+    if enqueued > 0 {
+        eprintln!("[icm] {source}: enqueued {enqueued} conversation excerpts");
+    }
+    enqueued
 }
 
 // ── Hook telemetry CLI ─────────────────────────────────────────────────
@@ -4689,8 +4821,9 @@ fn cmd_hook_end(
     embedder: Option<&dyn icm_core::Embedder>,
     memory_cfg: &crate::config::MemoryConfig,
     consolidate_cfg: &crate::config::ConsolidateConfig,
-    extraction_summarizer: &crate::config::SummarizerConfig,
+    extraction_cfg: &crate::config::ExtractionConfig,
 ) -> Result<()> {
+    let extraction_summarizer = &extraction_cfg.summarizer;
     // Reentrancy guard (#322): if this hook is firing inside an
     // ICM-spawned worker subtree, do nothing. The summarizer's
     // `claude -p` child sets `ICM_WORKER=1`, which every hook it triggers
@@ -4747,9 +4880,14 @@ fn cmd_hook_end(
     // immediately so Claude Code doesn't kill us with "Hook cancelled".
     // The transcript-extract path below stays for back-compat (it's
     // still cheap when --no-embeddings is set).
+    let input = read_stdin_utf8_lossy().unwrap_or_default();
     if extraction_summarizer.provider != "none"
         && let Ok(self_path) = std::env::current_exe()
     {
+        // Queued before the fork so the worker drains it in this run.
+        if extraction_cfg.conversation.enabled {
+            enqueue_conversation(store, &input, extraction_cfg, "session-end", true);
+        }
         // `nohup`-style detach: redirect std{in,out,err} to /dev/null
         // and let the child outlive us. The child reads the same
         // config so it picks up the same provider.
@@ -4790,13 +4928,21 @@ fn cmd_hook_end(
                     memory_cfg,
                     consolidate_cfg,
                     "session-end",
+                    &input,
                 );
             }
         }
         return Ok(());
     }
     // Inline path (legacy): scan transcript and extract via fastembed.
-    extract_from_hook_transcript(store, embedder, memory_cfg, consolidate_cfg, "session-end")
+    extract_from_hook_transcript(
+        store,
+        embedder,
+        memory_cfg,
+        consolidate_cfg,
+        "session-end",
+        &input,
+    )
 }
 
 /// Fork a detached, `ICM_WORKER`-tagged copy of this binary running
@@ -4830,13 +4976,13 @@ fn spawn_detached_worker(args: &[&str], label: &str) {
         }
     }
     match cmd.spawn() {
-        Ok(_) => eprintln!("[icm] session-end: forked async {label} worker"),
-        Err(e) => eprintln!("[icm] session-end: {label} worker fork failed ({e}), skipping"),
+        Ok(_) => eprintln!("[icm] forked async {label} worker"),
+        Err(e) => eprintln!("[icm] {label} worker fork failed ({e}), skipping"),
     }
 }
 
-/// Read JSON from stdin, locate the transcript file, parse the last 100
-/// assistant messages, and extract facts. Used by both PreCompact and
+/// From the hook's JSON `input`, locate the transcript file, parse the last
+/// 100 assistant messages, and extract facts. Used by both PreCompact and
 /// SessionEnd hooks. `source` is purely a log-prefix tag.
 ///
 /// Reads JSON from stdin with `transcript_path`, reads the JSONL transcript,
@@ -4847,12 +4993,9 @@ fn extract_from_hook_transcript(
     memory_cfg: &crate::config::MemoryConfig,
     consolidate_cfg: &crate::config::ConsolidateConfig,
     source: &str,
+    input: &str,
 ) -> Result<()> {
-    let Some(input) = read_stdin_utf8_lossy() else {
-        return Ok(());
-    };
-
-    let json: Value = match serde_json::from_str(&input) {
+    let json: Value = match serde_json::from_str(input) {
         Ok(v) => v,
         Err(_) => return Ok(()),
     };
@@ -5046,7 +5189,12 @@ pub(crate) fn cap_tool_output_for_inline_extraction(tool_output: &str) -> &str {
 /// UserPromptSubmit hook (Layer 2): inject recalled context at the start of each prompt.
 /// Reads JSON from stdin with `user_message`, recalls relevant memories,
 /// and prints context to stdout (Claude Code appends it as system-reminder).
-fn cmd_hook_prompt(store: &Store, archive_cfg: &crate::config::ArchiveConfig) -> Result<()> {
+fn cmd_hook_prompt(
+    store: &Store,
+    archive_cfg: &crate::config::ArchiveConfig,
+    recall_cfg: &crate::config::RecallConfig,
+    extraction_cfg: &crate::config::ExtractionConfig,
+) -> Result<()> {
     let Some(input) = read_stdin_utf8_lossy() else {
         return Ok(());
     };
@@ -5100,9 +5248,47 @@ fn cmd_hook_prompt(store: &Store, archive_cfg: &crate::config::ArchiveConfig) ->
     } else {
         Some(project.as_str())
     };
-    let ctx = extract::recall_context(store, query, project_filter, 5)?;
-    if !ctx.is_empty() {
-        emit_hook_context(&ctx);
+    // `[recall]` was documented but never read: the hook always injected 5
+    // memories, `enabled = false` included. It turns off the injection
+    // only; the extraction below still runs.
+    if recall_cfg.enabled {
+        let from_server = Some(recall_cfg.server_url.trim())
+            .filter(|url| !url.is_empty())
+            .and_then(|url| {
+                let token = Some(recall_cfg.server_token_env.trim())
+                    .filter(|name| !name.is_empty())
+                    .and_then(|name| std::env::var(name).ok());
+                // The whole prompt, not the 200 bytes the keyword recall
+                // takes: the meaning is in the sentence.
+                extract::recall_context_from_server(
+                    url,
+                    token.as_deref(),
+                    truncate_at_char_boundary(message, 2_000),
+                    project_filter,
+                    recall_cfg.server_limit,
+                    std::time::Duration::from_millis(recall_cfg.server_timeout_ms),
+                )
+            });
+        let ctx = match from_server {
+            Some(ctx) => ctx,
+            None => extract::recall_context(store, query, project_filter, recall_cfg.limit)?,
+        };
+        if !ctx.is_empty() {
+            emit_hook_context(&ctx);
+        }
+    }
+
+    // In-session extraction, after the recall so the prompt is not held up:
+    // each full excerpt is queued as soon as the conversation has one,
+    // instead of waiting for a compaction that may never come (a session
+    // that crashes, or is asked about before its first compaction).
+    // Opt-in (`[extraction.conversation] in_session`): it adds provider
+    // calls while the session runs.
+    if extraction_cfg.conversation.in_session
+        && std::env::var_os("ICM_WORKER").is_none()
+        && enqueue_conversation(store, &input, extraction_cfg, "prompt", false) > 0
+    {
+        spawn_detached_worker(&["extract-pending", "--limit", "20"], "extraction");
     }
 
     Ok(())
@@ -6454,14 +6640,33 @@ description: ICM persistent memory — /{name}
             if old_js_plugin.exists() {
                 std::fs::remove_file(&old_js_plugin).ok();
             }
-            if opencode_plugin_path.exists() {
-                println!("[hook] OpenCode plugin: already configured");
-            } else {
-                std::fs::create_dir_all(&opencode_plugins_dir).ok();
-                let plugin_content = include_str!("../../../plugins/opencode-icm.ts");
-                std::fs::write(&opencode_plugin_path, plugin_content)
-                    .with_context(|| format!("cannot write {}", opencode_plugin_path.display()))?;
-                println!("[hook] OpenCode plugin: installed");
+            // OpenCode 2 does not run V1 plugins (#516): install the plugin
+            // for the OpenCode on PATH, and swap ICM's own plugin when it
+            // is the other version's.
+            let (plugin_content, api) = opencode_plugin_for(opencode_major_version());
+            let existing = std::fs::read_to_string(&opencode_plugin_path).ok();
+            match existing.as_deref() {
+                Some(current) if current == plugin_content => {
+                    println!("[hook] OpenCode plugin: already configured ({api})");
+                }
+                Some(current) if !is_icm_opencode_plugin(current) => {
+                    println!(
+                        "[hook] OpenCode plugin: {} is not ICM's, left unchanged",
+                        opencode_plugin_path.display()
+                    );
+                }
+                _ => {
+                    std::fs::create_dir_all(&opencode_plugins_dir).ok();
+                    std::fs::write(&opencode_plugin_path, plugin_content).with_context(|| {
+                        format!("cannot write {}", opencode_plugin_path.display())
+                    })?;
+                    let verb = if existing.is_some() {
+                        "updated"
+                    } else {
+                        "installed"
+                    };
+                    println!("[hook] OpenCode plugin: {verb} ({api})");
+                }
             }
         } else {
             println!("[hook] {:<16} skipped (not detected)", "OpenCode");
@@ -6937,6 +7142,46 @@ fn check_json_target(target: &DoctorTarget) -> (usize, usize) {
 
 /// OpenCode installs a TypeScript plugin instead of a JSON hook entry, so
 /// it has no command path to validate — only file existence.
+/// The ICM plugin for an OpenCode major version, and its API name: the V2
+/// plugin for OpenCode 2 and later, the V1 one otherwise (also when no
+/// `opencode` was found, as before).
+fn opencode_plugin_for(major: Option<u32>) -> (&'static str, &'static str) {
+    match major {
+        Some(m) if m >= 2 => (
+            include_str!("../../../plugins/opencode-icm-v2.ts"),
+            "V2 API",
+        ),
+        _ => (include_str!("../../../plugins/opencode-icm.ts"), "V1 API"),
+    }
+}
+
+/// Major version of the `opencode` on PATH (`opencode v2.0.29` -> 2).
+fn opencode_major_version() -> Option<u32> {
+    let out = std::process::Command::new("opencode")
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    parse_major_version(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// First number of a version string: `opencode v2.0.29`, `1.19.3`.
+fn parse_major_version(text: &str) -> Option<u32> {
+    let start = text.find(|c: char| c.is_ascii_digit())?;
+    let digits: String = text[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
+}
+
+/// Whether an `icm.ts` in OpenCode's plugin directory is one ICM wrote (V1
+/// or V2), so `icm init` may replace it.
+fn is_icm_opencode_plugin(content: &str) -> bool {
+    content.contains("export const IcmPlugin") || content.contains("id: \"icm\"")
+}
+
 fn check_opencode_plugin(home: &str) -> usize {
     let plugin = PathBuf::from(home).join(".config/opencode/plugins/icm.ts");
     if plugin.exists() {
@@ -9045,6 +9290,16 @@ fn cmd_config(cli_db: Option<PathBuf>, cfg: &config::Config) -> Result<()> {
     println!("  max_facts = {}", cfg.extraction.max_facts);
     println!("  extract_every = {}", cfg.extraction.extract_every);
     println!("  store_raw = {}", cfg.extraction.store_raw);
+    let conv = &cfg.extraction.conversation;
+    println!();
+    println!("[extraction.conversation]");
+    println!("  enabled = {}", conv.enabled);
+    println!("  in_session = {}", conv.in_session);
+    println!("  excerpt_chars = {}", conv.excerpt_chars);
+    println!("  max_excerpts_per_fire = {}", conv.max_excerpts_per_fire);
+    println!("  user_chars = {}", conv.user_chars);
+    println!("  assistant_chars = {}", conv.assistant_chars);
+    println!("  tool_chars = {}", conv.tool_chars);
     // The summarizer sections decide whether an LLM is called and, for the
     // API-key providers, whose credit it spends — worth seeing at a glance.
     // `describe_config` reports whether the key variable is set, never its
@@ -9063,6 +9318,10 @@ fn cmd_config(cli_db: Option<PathBuf>, cfg: &config::Config) -> Result<()> {
     println!("[recall]");
     println!("  enabled = {}", cfg.recall.enabled);
     println!("  limit = {}", cfg.recall.limit);
+    if !cfg.recall.server_url.is_empty() {
+        println!("  server_url = {}", cfg.recall.server_url);
+        println!("  server_limit = {}", cfg.recall.server_limit);
+    }
     println!();
     println!("[mcp]");
     println!("  transport = {}", cfg.mcp.transport);
@@ -9207,6 +9466,11 @@ fn extract_pending_drain_fastembed(
     let ids: Vec<String> = pending.iter().map(|row| row.borrow().0.clone()).collect();
     let mut stored = 0usize;
     for row in pending {
+        // A whole conversation excerpt is not what the keyword extractor
+        // scores: it would keep tool noise. The excerpt is dropped.
+        if is_conversation_row(row.borrow()) {
+            continue;
+        }
         let (_, project, _, raw, _) = row.borrow();
         match extract::extract_and_store_with_embedder(
             store,
@@ -9227,13 +9491,20 @@ fn extract_pending_drain_fastembed(
 /// Partition queued rows by project, keeping first-appearance order across
 /// groups and the input order within each group (the store hands rows over
 /// `captured_at ASC`). One LLM prompt per group lets every extracted fact
-/// carry the project whose tool output produced it.
+/// carry the project whose tool output produced it. A conversation excerpt
+/// is a group of its own: it already fills one prompt.
 fn group_pending_by_project(
     pending: &[icm_store::PendingRow],
 ) -> Vec<(String, Vec<&icm_store::PendingRow>)> {
     let mut groups: Vec<(String, Vec<&icm_store::PendingRow>)> = Vec::new();
     for row in pending {
-        match groups.iter_mut().find(|(project, _)| *project == row.1) {
+        if is_conversation_row(row) {
+            groups.push((row.1.clone(), vec![row]));
+            continue;
+        }
+        match groups.iter_mut().find(|(project, rows)| {
+            *project == row.1 && !rows.iter().any(|r| is_conversation_row(r))
+        }) {
             Some((_, rows)) => rows.push(row),
             None => groups.push((row.1.clone(), vec![row])),
         }
@@ -9241,8 +9512,40 @@ fn group_pending_by_project(
     groups
 }
 
+/// What a group of queue rows says about the facts distilled from it: the
+/// distinct tools captured, joined by `,`, and the latest capture time (a
+/// fact cannot be traced to one row of the group).
+fn group_provenance(
+    rows: &[&icm_store::PendingRow],
+) -> (String, Option<chrono::DateTime<chrono::Utc>>) {
+    let mut tools: Vec<&str> = Vec::new();
+    let mut latest = None;
+    for row in rows {
+        if !tools.contains(&row.2.as_str()) {
+            tools.push(&row.2);
+        }
+        if let Ok(at) = chrono::DateTime::parse_from_rfc3339(&row.4) {
+            let at = at.with_timezone(&chrono::Utc);
+            if latest.is_none_or(|l| at > l) {
+                latest = Some(at);
+            }
+        }
+    }
+    (tools.join(","), latest)
+}
+
+/// A queued conversation excerpt, not a tool output.
+fn is_conversation_row(row: &icm_store::PendingRow) -> bool {
+    row.2 == conversation::CONVERSATION_ROW_TOOL
+}
+
 /// Build the fact-extraction prompt for one project's queued rows.
 fn build_extract_prompt(rows: &[&icm_store::PendingRow]) -> String {
+    if let [row] = rows
+        && is_conversation_row(row)
+    {
+        return conversation::build_conversation_prompt(&row.1, &row.3);
+    }
     let mut joined = String::new();
     for (_, project, tool_name, raw, _) in rows.iter().copied() {
         joined.push_str(&format!("=== tool={tool_name} project={project} ===\n"));
@@ -9352,6 +9655,10 @@ struct DrainTally {
     /// Rows dropped because the provider's reply held no list item at all
     /// (it ignored the format): nothing was stored from them.
     unformatted_rows: usize,
+    /// Conversation excerpts left in the queue because the provider failed:
+    /// the keyword extractor is no substitute for them, the next drain
+    /// retries them.
+    deferred_rows: usize,
 }
 
 impl DrainTally {
@@ -9372,6 +9679,12 @@ impl DrainTally {
             notes.push(format!(
                 "{} dropped after empty provider output",
                 self.discarded_rows
+            ));
+        }
+        if self.deferred_rows > 0 {
+            notes.push(format!(
+                "{} conversation excerpts left queued after a provider failure",
+                self.deferred_rows
             ));
         }
         let notes = if notes.is_empty() {
@@ -9408,7 +9721,12 @@ fn drain_pending_groups(
 
     for (project, rows) in groups {
         let ids: Vec<String> = rows.iter().map(|row| row.0.clone()).collect();
+        let conversation = rows.iter().any(|row| is_conversation_row(row));
 
+        if provider_failed && conversation {
+            tally.deferred_rows += rows.len();
+            continue;
+        }
         if provider_failed {
             let (stored, deleted) = extract_pending_drain_fastembed(store, embedder, rows)?;
             eprintln!(
@@ -9458,6 +9776,10 @@ fn drain_pending_groups(
                      fastembed fallback for this group and the remaining groups"
                 );
                 provider_failed = true;
+                if conversation {
+                    tally.deferred_rows += rows.len();
+                    continue;
+                }
                 let (stored, deleted) = extract_pending_drain_fastembed(store, embedder, rows)?;
                 tally.stored += stored;
                 tally.deleted += deleted;
@@ -9469,6 +9791,7 @@ fn drain_pending_groups(
         // Parse bullet output into individual facts, each filed under the
         // project whose rows produced it.
         let topic = format!("context-{project}");
+        let (tools, captured_at) = group_provenance(rows);
         let mut items = 0usize;
         for line in response.lines() {
             let fact = match reply_line(line) {
@@ -9481,6 +9804,18 @@ fn drain_pending_groups(
             };
             items += 1;
             let mut mem = Memory::new(topic.clone(), fact.to_string(), Importance::Medium);
+            // Dated when it was captured, not when the queue drained (#520):
+            // a backlog drained weeks later must not look fresh to the
+            // decay or the recall date arm. And marked as distilled.
+            if let Some(at) = captured_at {
+                mem.created_at = at;
+                mem.updated_at = at;
+                mem.last_accessed = at;
+            }
+            mem.source = icm_core::MemorySource::Extracted {
+                tool: tools.clone(),
+                project: project.clone(),
+            };
             // Same bug class as #394: this LLM-backed extraction path is a
             // sibling of extract_and_store_with_embedder and had the same gap
             // — the embedder was available but never attached to the Memory.
@@ -15255,6 +15590,7 @@ mod cli_contracts_tests {
             fallback_rows: 3,
             discarded_rows: 4,
             unformatted_rows: 0,
+            deferred_rows: 0,
         };
         let line = degraded.summary_line(25);
         assert!(
@@ -19457,5 +19793,342 @@ mod shell_text_tests {
         assert!(out.contains("You MUST call `icm.exe store`."), "{out}");
         // Nothing is doubled on a second pass.
         assert_eq!(command_text_for(&out, true), out);
+    }
+}
+
+#[cfg(test)]
+mod conversation_queue_tests {
+    use super::*;
+    use icm_store::Store;
+
+    fn line(role: &str, text: &str) -> String {
+        serde_json::json!({
+            "type": role,
+            "timestamp": "2026-10-16T09:00:00.000Z",
+            "message": {"role": role, "content": text},
+        })
+        .to_string()
+    }
+
+    fn hook_input(transcript: &std::path::Path) -> String {
+        serde_json::json!({
+            "session_id": "s1",
+            "transcript_path": transcript.to_str().unwrap(),
+            "cwd": "/work/myproj",
+        })
+        .to_string()
+    }
+
+    fn llm_cfg() -> crate::config::ExtractionConfig {
+        let mut cfg = crate::config::ExtractionConfig::default();
+        cfg.summarizer.provider = "claude".into();
+        cfg
+    }
+
+    #[test]
+    fn enqueues_only_what_was_not_enqueued_yet() {
+        let store = Store::in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{}\n",
+                line("user", "run the tests on GKE, not on prod"),
+                line("assistant", "ok, cluster rtk-bench")
+            ),
+        )
+        .unwrap();
+        let input = hook_input(&path);
+
+        assert_eq!(
+            enqueue_conversation(&store, &input, &llm_cfg(), "test", true),
+            1
+        );
+        let rows = store.list_pending_extractions(10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, "myproj");
+        assert_eq!(rows[0].2, conversation::CONVERSATION_ROW_TOOL);
+        assert!(
+            rows[0]
+                .3
+                .contains("[2026-10-16T09:00 user] run the tests on GKE")
+        );
+
+        // Nothing new: nothing enqueued.
+        assert_eq!(
+            enqueue_conversation(&store, &input, &llm_cfg(), "test", true),
+            0
+        );
+
+        // An appended line, and a last one still being written (no newline).
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        use std::io::Write as _;
+        write!(
+            f,
+            "{}\n{}",
+            line("user", "use port 8080"),
+            line("user", "partial")
+        )
+        .unwrap();
+        assert_eq!(
+            enqueue_conversation(&store, &input, &llm_cfg(), "test", true),
+            1
+        );
+        let rows = store.list_pending_extractions(10).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows[1].3.contains("use port 8080"));
+        assert!(!rows[1].3.contains("GKE"));
+        assert!(!rows[1].3.contains("partial"));
+    }
+
+    /// In session (no flush): nothing until an excerpt is full, then only
+    /// full excerpts; the compaction that follows queues the rest, and no
+    /// line is queued twice.
+    #[test]
+    fn in_session_queues_full_excerpts_only_and_compaction_the_rest() {
+        let store = Store::in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        let input = hook_input(&path);
+        let msg = |i: usize| format!("{}\n", line("user", &format!("m{i}:{}", "u".repeat(3_900))));
+
+        std::fs::write(&path, msg(0)).unwrap();
+        assert_eq!(
+            enqueue_conversation(&store, &input, &llm_cfg(), "test", false),
+            0
+        );
+        assert!(store.list_pending_extractions(10).unwrap().is_empty());
+
+        let all: String = (0..20).map(msg).collect();
+        std::fs::write(&path, &all).unwrap();
+        assert_eq!(
+            enqueue_conversation(&store, &input, &llm_cfg(), "test", false),
+            1
+        );
+        let first = store.list_pending_extractions(10).unwrap();
+        assert!(first[0].3.contains("m0:"));
+        assert!(!first[0].3.contains("m19:"));
+
+        assert_eq!(
+            enqueue_conversation(&store, &input, &llm_cfg(), "test", true),
+            1
+        );
+        let rows = store.list_pending_extractions(10).unwrap();
+        assert!(rows[1].3.contains("m19:"));
+        let queued: usize = rows
+            .iter()
+            .map(|r| r.3.matches("[2026-10-16T09:00 user] m").count())
+            .sum();
+        assert_eq!(queued, 20, "every message queued exactly once");
+    }
+
+    #[test]
+    fn nothing_without_an_llm_provider_or_when_disabled() {
+        let store = Store::in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        std::fs::write(&path, format!("{}\n", line("user", "hello there"))).unwrap();
+        let input = hook_input(&path);
+
+        let mut none = llm_cfg();
+        none.summarizer.provider = "none".into();
+        assert_eq!(enqueue_conversation(&store, &input, &none, "test", true), 0);
+        let mut off = llm_cfg();
+        off.enabled = false;
+        assert_eq!(enqueue_conversation(&store, &input, &off, "test", true), 0);
+        assert!(store.list_pending_extractions(10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_conversation_row_is_its_own_group_with_its_own_prompt() {
+        let row = |id: &str, tool: &str| -> icm_store::PendingRow {
+            (
+                id.to_string(),
+                "a".to_string(),
+                tool.to_string(),
+                format!("raw {id}"),
+                format!("2026-01-01T00:00:0{id}Z"),
+            )
+        };
+        let pending = vec![
+            row("1", "Bash"),
+            row("2", conversation::CONVERSATION_ROW_TOOL),
+            row("3", "Bash"),
+            row("4", conversation::CONVERSATION_ROW_TOOL),
+        ];
+        let groups = group_pending_by_project(&pending);
+        let ids: Vec<Vec<&str>> = groups
+            .iter()
+            .map(|(_, rows)| rows.iter().map(|r| r.0.as_str()).collect())
+            .collect();
+        assert_eq!(ids, vec![vec!["1", "3"], vec!["2"], vec!["4"]]);
+
+        let tool_prompt = build_extract_prompt(&groups[0].1);
+        assert!(tool_prompt.starts_with("From the tool outputs below"));
+        let conv_prompt = build_extract_prompt(&groups[1].1);
+        assert!(conv_prompt.contains("<excerpt>\nraw 2\n</excerpt>"));
+    }
+
+    /// A provider that fails on the first call: the conversation excerpt
+    /// stays queued for the next drain, the tool rows after it still take
+    /// the local extractor.
+    #[test]
+    fn a_provider_failure_leaves_conversation_excerpts_queued() {
+        struct Down;
+        impl summarizer::Summarizer for Down {
+            fn name(&self) -> &'static str {
+                "down"
+            }
+            fn summarize(&self, _: &summarizer::SummarizeRequest<'_>) -> Result<String> {
+                Err(anyhow::anyhow!("provider down"))
+            }
+        }
+        let store = Store::in_memory().unwrap();
+        store
+            .enqueue_pending_extraction("a", conversation::CONVERSATION_ROW_TOOL, "[t user] hi")
+            .unwrap();
+        store
+            .enqueue_pending_extraction(
+                "a",
+                "Bash",
+                "We decided to shard billing by tenant because of write contention.",
+            )
+            .unwrap();
+        store
+            .enqueue_pending_extraction("b", conversation::CONVERSATION_ROW_TOOL, "[t user] yo")
+            .unwrap();
+        let pending = store.list_pending_extractions(10).unwrap();
+        let groups = group_pending_by_project(&pending);
+        let mut tally = DrainTally::default();
+        drain_pending_groups(
+            &store,
+            None,
+            &Down,
+            None,
+            256,
+            std::time::Duration::from_secs(5),
+            &groups,
+            &mut tally,
+        )
+        .unwrap();
+
+        let left = store.list_pending_extractions(10).unwrap();
+        let tools: Vec<&str> = left.iter().map(|r| r.2.as_str()).collect();
+        assert_eq!(tools, vec![conversation::CONVERSATION_ROW_TOOL; 2]);
+        assert_eq!(
+            (tally.deferred_rows, tally.fallback_rows, tally.deleted),
+            (2, 1, 1)
+        );
+        assert!(
+            tally
+                .summary_line(3)
+                .contains("2 conversation excerpts left queued after a provider failure")
+        );
+    }
+
+    /// A fact distilled weeks after its capture is dated at the capture, and
+    /// says it was distilled, from which tools, for which project (#520).
+    #[test]
+    fn distilled_facts_carry_the_capture_time_and_their_provenance() {
+        struct OneFact;
+        impl summarizer::Summarizer for OneFact {
+            fn name(&self) -> &'static str {
+                "one-fact"
+            }
+            fn summarize(&self, _: &summarizer::SummarizeRequest<'_>) -> Result<String> {
+                Ok("- billing runs on PostgreSQL 16.\n".into())
+            }
+        }
+        let store = Store::in_memory().unwrap();
+        let row = |id: &str, tool: &str, at: &str| -> icm_store::PendingRow {
+            (
+                id.into(),
+                "billing".into(),
+                tool.into(),
+                "raw".into(),
+                at.into(),
+            )
+        };
+        let pending = vec![
+            row("1", "Bash", "2026-09-01T10:00:00+00:00"),
+            row("2", "Read", "2026-09-02T08:30:00+00:00"),
+            row("3", "Bash", "2026-09-01T12:00:00+00:00"),
+        ];
+        let groups = group_pending_by_project(&pending);
+        let mut tally = DrainTally::default();
+        drain_pending_groups(
+            &store,
+            None,
+            &OneFact,
+            None,
+            256,
+            std::time::Duration::from_secs(5),
+            &groups,
+            &mut tally,
+        )
+        .unwrap();
+
+        let stored = store.get_by_topic("context-billing").unwrap();
+        assert_eq!(stored.len(), 1);
+        let m = &stored[0];
+        assert_eq!(m.created_at.to_rfc3339(), "2026-09-02T08:30:00+00:00");
+        assert_eq!(m.last_accessed, m.created_at);
+        match &m.source {
+            icm_core::MemorySource::Extracted { tool, project } => {
+                assert_eq!(tool, "Bash,Read");
+                assert_eq!(project, "billing");
+            }
+            other => panic!("expected an extracted source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fastembed_fallback_drops_conversation_rows_without_storing() {
+        let store = Store::in_memory().unwrap();
+        store
+            .enqueue_pending_extraction(
+                "a",
+                conversation::CONVERSATION_ROW_TOOL,
+                "[t user] We decided to use PostgreSQL for the billing service because of JSONB.",
+            )
+            .unwrap();
+        let pending = store.list_pending_extractions(10).unwrap();
+        let (stored, deleted) = extract_pending_drain_fastembed(&store, None, &pending).unwrap();
+        assert_eq!((stored, deleted), (0, 1));
+        assert!(store.list_pending_extractions(10).unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod opencode_plugin_tests {
+    use super::*;
+
+    #[test]
+    fn the_plugin_follows_the_opencode_major_version() {
+        assert_eq!(parse_major_version("opencode v2.0.29\n"), Some(2));
+        assert_eq!(parse_major_version("1.19.3"), Some(1));
+        assert_eq!(parse_major_version("no version"), None);
+        // OpenCode 2 does not run V1 plugins (#516).
+        let (v2, api) = opencode_plugin_for(Some(2));
+        assert!(v2.contains("Plugin.define") && api == "V2 API");
+        assert!(opencode_plugin_for(Some(3)).0.contains("Plugin.define"));
+        // No opencode found, or OpenCode 1: the V1 plugin, as before.
+        for major in [None, Some(1)] {
+            let (v1, api) = opencode_plugin_for(major);
+            assert!(v1.contains("export const IcmPlugin") && api == "V1 API");
+        }
+    }
+
+    #[test]
+    fn only_icms_own_plugins_are_replaced() {
+        assert!(is_icm_opencode_plugin(opencode_plugin_for(Some(1)).0));
+        assert!(is_icm_opencode_plugin(opencode_plugin_for(Some(2)).0));
+        assert!(!is_icm_opencode_plugin(
+            "export default definePlugin({ id: \"mine\" })"
+        ));
     }
 }

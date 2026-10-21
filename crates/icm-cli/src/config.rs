@@ -161,6 +161,8 @@ pub struct ExtractionConfig {
     pub extract_every: usize,
     /// Store raw text as fallback when no facts are extracted.
     pub store_raw: bool,
+    /// LLM extraction from the conversation itself (`[extraction.conversation]`).
+    pub conversation: ConversationExtractionConfig,
     /// LLM-backed extraction provider. When set to anything other than
     /// `none`, hooks switch to the **fast async path**: tool output is
     /// stored verbatim into a `pending_extractions` queue (~50ms / fire,
@@ -175,13 +177,80 @@ pub struct ExtractionConfig {
     pub summarizer: SummarizerConfig,
 }
 
-/// Context recall/injection settings (Layer 2).
+/// `[extraction.conversation]`: LLM extraction from what the user and the
+/// agent wrote, not only from tool output. Every switch is off by default:
+/// each one adds provider calls (one per excerpt). Needs an extraction
+/// summarizer other than `none`.
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct ConversationExtractionConfig {
+    /// At compaction (PreCompact) and session end (SessionEnd), queue the
+    /// conversation not yet extracted (#518). Off: compaction runs the
+    /// keyword pass over the transcript, as before.
+    pub enabled: bool,
+    /// Also queue it during the session, from the prompt hook, as soon as a
+    /// full excerpt is written (#519), instead of waiting for compaction.
+    pub in_session: bool,
+    /// Characters per excerpt: one provider call each.
+    pub excerpt_chars: usize,
+    /// Excerpts queued per hook fire, the most recent kept.
+    pub max_excerpts_per_fire: usize,
+    /// Per-message caps, in characters.
+    pub user_chars: usize,
+    pub assistant_chars: usize,
+    pub tool_chars: usize,
+}
+
+impl Default for ConversationExtractionConfig {
+    fn default() -> Self {
+        let limits = crate::conversation::Limits::default();
+        Self {
+            enabled: false,
+            in_session: false,
+            excerpt_chars: limits.excerpt_chars,
+            max_excerpts_per_fire: limits.max_excerpts_per_fire,
+            user_chars: limits.user_chars,
+            assistant_chars: limits.assistant_chars,
+            tool_chars: limits.tool_chars,
+        }
+    }
+}
+
+impl ConversationExtractionConfig {
+    /// The rendering and cut sizes; a 0 is read as 1.
+    pub fn limits(&self) -> crate::conversation::Limits {
+        crate::conversation::Limits {
+            excerpt_chars: self.excerpt_chars.max(1),
+            max_excerpts_per_fire: self.max_excerpts_per_fire.max(1),
+            user_chars: self.user_chars.max(1),
+            assistant_chars: self.assistant_chars.max(1),
+            tool_chars: self.tool_chars.max(1),
+        }
+    }
+}
+
+/// Context recall/injection settings (Layer 2): the memories the
+/// UserPromptSubmit hook injects on each prompt.
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct RecallConfig {
+    /// `false` stops the injection; the hook still archives the prompt and
+    /// queues conversation excerpts.
     pub enabled: bool,
     /// Maximum memories to inject.
     pub limit: usize,
+    /// Base URL of a running `icm serve --http` (e.g. `http://127.0.0.1:7777`).
+    /// When set, the hook asks it first: the server keeps the embedding model
+    /// loaded, so the recall is hybrid (keywords and meaning) at no model-load
+    /// cost. No answer within `server_timeout_ms`, an error or no memory: the
+    /// hook falls back to its own keyword recall. Empty: off.
+    pub server_url: String,
+    /// Environment variable holding the server's `--token`, if it has one.
+    pub server_token_env: String,
+    /// Maximum memories to inject from the server.
+    pub server_limit: usize,
+    /// How long the hook waits for the server, in milliseconds.
+    pub server_timeout_ms: u64,
 }
 
 /// Wake-up pack settings (SessionStart hook).
@@ -383,6 +452,7 @@ impl Default for ExtractionConfig {
             max_facts: 20,
             extract_every: 3,
             store_raw: true,
+            conversation: ConversationExtractionConfig::default(),
             // Default = auto: detect an installed LLM CLI and route
             // extraction through the #219 async queue (~50ms hooks, no
             // fastembed load). `extract-pending` falls back to a batched
@@ -405,7 +475,14 @@ impl Default for RecallConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            limit: 15,
+            // What the hook always injected before it read this setting.
+            limit: 5,
+            server_url: String::new(),
+            server_token_env: String::new(),
+            // Measured on 100 questions over 14 real sessions: hybrid recall
+            // of 10 memories answered about 6 more than keyword recall of 5.
+            server_limit: 10,
+            server_timeout_ms: 800,
         }
     }
 }
@@ -499,12 +576,29 @@ pub fn show_config_path() -> String {
 mod tests {
     use super::*;
 
+    /// Conversation extraction (#518, #519) is opt-in: by default the
+    /// hooks behave as before it.
+    #[test]
+    fn conversation_extraction_is_off_by_default() {
+        let conv = &Config::default().extraction.conversation;
+        assert!(!conv.enabled && !conv.in_session);
+        assert_eq!(conv.limits(), crate::conversation::Limits::default());
+        let config: Config = toml::from_str(
+            "[extraction.conversation]\nenabled = true\nin_session = true\nassistant_chars = 8000\n",
+        )
+        .unwrap();
+        let conv = &config.extraction.conversation;
+        assert!(conv.enabled && conv.in_session);
+        assert_eq!(conv.limits().assistant_chars, 8000);
+        assert_eq!(conv.limits().user_chars, crate::conversation::USER_CHARS);
+    }
+
     #[test]
     fn test_default_config() {
         let config = Config::default();
         assert!(config.extraction.enabled);
         assert_eq!(config.memory.decay_rate, 0.95);
-        assert_eq!(config.recall.limit, 15);
+        assert_eq!(config.recall.limit, 5);
         assert!(config.mcp.compact);
     }
 

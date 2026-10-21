@@ -15,15 +15,15 @@
 //! per-surface filtering) stays available on request, to roll back or to
 //! compare. [`RecallEngine::resolve`] decides which one a request gets.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Local, Utc};
 
 use icm_core::temporal::parse_query_window_at;
 use icm_core::{
-    Embedder, ITEM_OVERHEAD_TOKENS, IcmError, IcmResult, Memory, MemoryStore, RankedHit,
-    RankedQuery, TimeWindow, estimate_tokens, is_preference_topic, keyword_matches,
-    parse_query_window, project_matches, select_within_budget, topic_matches,
+    Embedder, ITEM_OVERHEAD_TOKENS, IcmError, IcmResult, Memory, MemoryStore, RRF_K, RankedHit,
+    RankedList, RankedQuery, TimeWindow, estimate_tokens, is_preference_topic, keyword_matches,
+    parse_query_window, project_matches, rrf_fuse, select_within_budget, topic_matches,
 };
 
 use crate::backend::Store;
@@ -172,10 +172,35 @@ impl RecallRequest<'_> {
         &self,
         store: &Store,
         embedder: Option<&dyn Embedder>,
-        cost: &dyn Fn(&Memory, f32) -> usize,
+        cost: &dyn Fn(&Memory, f32, &icm_core::RawRelevance) -> usize,
     ) -> IcmResult<RecallOutcome> {
         let depth_env = std::env::var(DEPTH_ENV).ok();
-        recall_with_depth(store, embedder, self, cost, depth_env.as_deref(), true)
+        recall_with_depth(store, embedder, self, &[], cost, depth_env.as_deref(), true)
+    }
+
+    /// [`Self::run_with_cost`] over several queries at once (#522): each is
+    /// ranked on its own (lexical, vector and date arms), the rankings are
+    /// fused by Reciprocal Rank Fusion, a memory found by several queries
+    /// appears once, and the filters, the cut, the neighbors and the access
+    /// bookkeeping run once on the merged list. `self.query` is the first
+    /// query; `more` are the others (blank ones are ignored).
+    pub fn run_many_with_cost(
+        &self,
+        more: &[&str],
+        store: &Store,
+        embedder: Option<&dyn Embedder>,
+        cost: &dyn Fn(&Memory, f32, &icm_core::RawRelevance) -> usize,
+    ) -> IcmResult<RecallOutcome> {
+        let depth_env = std::env::var(DEPTH_ENV).ok();
+        recall_with_depth(
+            store,
+            embedder,
+            self,
+            more,
+            cost,
+            depth_env.as_deref(),
+            true,
+        )
     }
 
     /// [`Self::run_with_cost`] without its writes: no auto-decay, no access
@@ -187,10 +212,39 @@ impl RecallRequest<'_> {
         &self,
         store: &Store,
         embedder: Option<&dyn Embedder>,
-        cost: &dyn Fn(&Memory, f32) -> usize,
+        cost: &dyn Fn(&Memory, f32, &icm_core::RawRelevance) -> usize,
     ) -> IcmResult<RecallOutcome> {
         let depth_env = std::env::var(DEPTH_ENV).ok();
-        recall_with_depth(store, embedder, self, cost, depth_env.as_deref(), false)
+        recall_with_depth(
+            store,
+            embedder,
+            self,
+            &[],
+            cost,
+            depth_env.as_deref(),
+            false,
+        )
+    }
+
+    /// [`Self::run_read_only`] over several queries, merged as
+    /// [`Self::run_many_with_cost`] merges them.
+    pub fn run_many_read_only(
+        &self,
+        more: &[&str],
+        store: &Store,
+        embedder: Option<&dyn Embedder>,
+        cost: &dyn Fn(&Memory, f32, &icm_core::RawRelevance) -> usize,
+    ) -> IcmResult<RecallOutcome> {
+        let depth_env = std::env::var(DEPTH_ENV).ok();
+        recall_with_depth(
+            store,
+            embedder,
+            self,
+            more,
+            cost,
+            depth_env.as_deref(),
+            false,
+        )
     }
 }
 
@@ -209,6 +263,9 @@ pub struct RecallHit {
     pub fts_rank: Option<u32>,
     pub vec_rank: Option<u32>,
     pub time_rank: Option<u32>,
+    /// BM25 and cosine similarity before fusion (#521); empty for a
+    /// neighbor, a substring match or a backend that does not report them.
+    pub raw: icm_core::RawRelevance,
 }
 
 /// Result of [`recall_v2`].
@@ -245,7 +302,7 @@ pub fn recall_v2(
 /// Estimated tokens of a memory as one element of a pretty-printed JSON
 /// array (every field but the embedding), plus an allowance for the score
 /// a renderer adds.
-fn full_record_cost(memory: &Memory, _score: f32) -> usize {
+fn full_record_cost(memory: &Memory, _score: f32, _raw: &icm_core::RawRelevance) -> usize {
     let mut record = memory.clone();
     record.embedding = None;
     let tokens = match serde_json::to_string_pretty(std::slice::from_ref(&record)) {
@@ -264,7 +321,8 @@ fn recall_with_depth(
     store: &Store,
     embedder: Option<&dyn Embedder>,
     req: &RecallRequest<'_>,
-    cost: &dyn Fn(&Memory, f32) -> usize,
+    more: &[&str],
+    cost: &dyn Fn(&Memory, f32, &icm_core::RawRelevance) -> usize,
     depth_env: Option<&str>,
     bookkeeping: bool,
 ) -> IcmResult<RecallOutcome> {
@@ -277,39 +335,26 @@ fn recall_with_depth(
 
     let limit = req.limit.clamp(1, MAX_LIMIT);
     let depth = depth_from(limit, depth_env);
-
-    let embedding = embedder.and_then(|e| match e.embed_query(req.query) {
-        Ok(v) => Some(v),
-        Err(err) => {
-            tracing::warn!(error = %err, "query embedding failed, lexical recall only");
-            None
-        }
-    });
-    // A caller-supplied anchor says nothing of where the caller is: its
-    // days are cut in UTC. Without one, "yesterday" is the user's own.
-    let window = match req.now {
-        Some(now) => parse_query_window(req.query, now),
-        None => parse_query_window_at(req.query, Utc::now(), *Local::now().offset()),
-    };
-
     let keep = |m: &Memory| passes_filters(req, m);
-    let query = RankedQuery {
-        text: req.query,
-        embedding: embedding.as_deref(),
-        // Under a budget the budget does the cutting, so ask for every
-        // fused candidate.
-        limit: if req.max_tokens.is_some() {
-            depth
-        } else {
-            limit
-        },
-        depth,
-        window,
-    };
-    let mut ranked = store.search_ranked(&query, &keep)?;
-    if ranked.is_empty() {
-        ranked = substring_matches(store, req.query, limit, &keep);
+
+    let mut queries: Vec<&str> = vec![req.query];
+    for q in more {
+        if !q.trim().is_empty() && !queries.contains(q) {
+            queries.push(q);
+        }
     }
+    let mut window = None;
+    let mut lists: Vec<Vec<RankedHit>> = Vec::with_capacity(queries.len());
+    for text in &queries {
+        let (ranked, w) = rank_one(store, embedder, req, text, limit, depth, &keep)?;
+        window = window.or(w);
+        lists.push(ranked);
+    }
+    let ranked = if lists.len() == 1 {
+        lists.pop().unwrap_or_default()
+    } else {
+        fuse_queries(lists)
+    };
 
     let mut outcome = cut(ranked, req.max_tokens, limit, window, cost);
     if req.expand_neighbors {
@@ -327,6 +372,88 @@ fn recall_with_depth(
     }
 
     Ok(outcome)
+}
+
+/// One query's ranking: its own embedding and date window, the ranked
+/// search, the substring fallback when no arm matched.
+fn rank_one(
+    store: &Store,
+    embedder: Option<&dyn Embedder>,
+    req: &RecallRequest<'_>,
+    text: &str,
+    limit: usize,
+    depth: usize,
+    keep: &dyn Fn(&Memory) -> bool,
+) -> IcmResult<(Vec<RankedHit>, Option<TimeWindow>)> {
+    let embedding = embedder.and_then(|e| match e.embed_query(text) {
+        Ok(v) => Some(v),
+        Err(err) => {
+            tracing::warn!(error = %err, "query embedding failed, lexical recall only");
+            None
+        }
+    });
+    // A caller-supplied anchor says nothing of where the caller is: its
+    // days are cut in UTC. Without one, "yesterday" is the user's own.
+    let window = match req.now {
+        Some(now) => parse_query_window(text, now),
+        None => parse_query_window_at(text, Utc::now(), *Local::now().offset()),
+    };
+    let query = RankedQuery {
+        text,
+        embedding: embedding.as_deref(),
+        // Under a budget the budget does the cutting, so ask for every
+        // fused candidate.
+        limit: if req.max_tokens.is_some() {
+            depth
+        } else {
+            limit
+        },
+        depth,
+        window,
+    };
+    let mut ranked = store.search_ranked(&query, keep)?;
+    if ranked.is_empty() {
+        ranked = substring_matches(store, text, limit, keep);
+    }
+    Ok((ranked, window))
+}
+
+/// Several queries' rankings as one: Reciprocal Rank Fusion over the
+/// lists, each memory once, with the arm ranks of the query that ranked it
+/// best.
+fn fuse_queries(lists: Vec<Vec<RankedHit>>) -> Vec<RankedHit> {
+    let ids: Vec<Vec<String>> = lists
+        .iter()
+        .map(|l| l.iter().map(|h| h.memory.id.clone()).collect())
+        .collect();
+    let ranked_lists: Vec<RankedList<'_>> = ids
+        .iter()
+        .map(|ids| RankedList {
+            name: "query",
+            ids,
+            weight: 1.0,
+        })
+        .collect();
+    let fused = rrf_fuse(&ranked_lists, RRF_K);
+    let mut best: HashMap<String, (usize, RankedHit)> = HashMap::new();
+    for list in lists {
+        for (pos, hit) in list.into_iter().enumerate() {
+            match best.get(&hit.memory.id) {
+                Some((p, _)) if *p <= pos => {}
+                _ => {
+                    best.insert(hit.memory.id.clone(), (pos, hit));
+                }
+            }
+        }
+    }
+    fused
+        .into_iter()
+        .filter_map(|f| {
+            let (_, mut hit) = best.remove(&f.id)?;
+            hit.score = f.score;
+            Some(hit)
+        })
+        .collect()
 }
 
 /// Last resort when no arm matched anything: memories that contain a query
@@ -379,6 +506,7 @@ fn substring_matches(
             fts_rank: None,
             vec_rank: None,
             time_rank: None,
+            raw: icm_core::RawRelevance::default(),
         })
         .collect()
 }
@@ -402,13 +530,16 @@ fn cut(
     max_tokens: Option<usize>,
     limit: usize,
     window: Option<TimeWindow>,
-    cost: &dyn Fn(&Memory, f32) -> usize,
+    cost: &dyn Fn(&Memory, f32, &icm_core::RawRelevance) -> usize,
 ) -> RecallOutcome {
     let candidates = ranked.len();
     if max_tokens.is_none() {
         ranked.truncate(limit);
     }
-    let costs: Vec<usize> = ranked.iter().map(|h| cost(&h.memory, h.score)).collect();
+    let costs: Vec<usize> = ranked
+        .iter()
+        .map(|h| cost(&h.memory, h.score, &h.raw))
+        .collect();
 
     let (kept, used_tokens, skipped_for_budget) = match max_tokens {
         Some(budget) => {
@@ -433,6 +564,7 @@ fn cut(
                 fts_rank: hit.fts_rank,
                 vec_rank: hit.vec_rank,
                 time_rank: hit.time_rank,
+                raw: hit.raw,
             })
         })
         .collect();
@@ -463,7 +595,7 @@ fn append_neighbors(
     max_tokens: Option<usize>,
     limit: usize,
     keep: &dyn Fn(&Memory) -> bool,
-    cost: &dyn Fn(&Memory, f32) -> usize,
+    cost: &dyn Fn(&Memory, f32, &icm_core::RawRelevance) -> usize,
 ) {
     let Some(floor) = outcome.hits.last().map(|h| h.score) else {
         return;
@@ -515,7 +647,7 @@ fn append_neighbors(
             continue;
         }
         let score = (parent_score * NEIGHBOR_DISCOUNT).min(floor);
-        let est_tokens = cost(&memory, score);
+        let est_tokens = cost(&memory, score, &icm_core::RawRelevance::default());
         if let Some(left) = tokens_left.as_mut() {
             if est_tokens > *left {
                 continue;
@@ -530,6 +662,7 @@ fn append_neighbors(
             fts_rank: None,
             vec_rank: None,
             time_rank: None,
+            raw: icm_core::RawRelevance::default(),
         });
         added += 1;
     }
@@ -551,6 +684,7 @@ mod tests {
             fts_rank: Some(1),
             vec_rank: None,
             time_rank: None,
+            raw: icm_core::RawRelevance::default(),
         }
     }
 
@@ -756,7 +890,7 @@ mod tests {
     }
 
     /// A caller that renders the summary and eight tokens of framing.
-    fn summary_cost(m: &Memory, _score: f32) -> usize {
+    fn summary_cost(m: &Memory, _score: f32, _raw: &icm_core::RawRelevance) -> usize {
         estimate_tokens(&m.summary) + 8
     }
 
@@ -770,7 +904,8 @@ mod tests {
 
         // The cost sees the score the hit is rendered with.
         let ranked = vec![ranked_hit("a", 0.25), ranked_hit("b", 0.75)];
-        let by_score = |_: &Memory, score: f32| (score * 100.0) as usize;
+        let by_score =
+            |_: &Memory, score: f32, _: &icm_core::RawRelevance| (score * 100.0) as usize;
         let out = cut(ranked, None, 5, None, &by_score);
         let charged: Vec<usize> = out.hits.iter().map(|h| h.est_tokens).collect();
         assert_eq!(charged, vec![25, 75]);
@@ -836,21 +971,24 @@ mod tests {
     #[test]
     fn full_record_cost_counts_every_rendered_field() {
         let mut m = mem("errors-resolved", "short summary");
-        let bare = full_record_cost(&m, 1.0);
+        let bare = full_record_cost(&m, 1.0, &icm_core::RawRelevance::default());
         // Field names, id, three timestamps: far more than the summary.
         assert!(bare > 80, "{bare}");
 
         m.raw_excerpt = Some("e".repeat(4000));
-        let with_raw = full_record_cost(&m, 1.0);
+        let with_raw = full_record_cost(&m, 1.0, &icm_core::RawRelevance::default());
         assert!(with_raw >= bare + 990, "{with_raw} vs {bare}");
 
         m.keywords = vec!["k".repeat(400)];
-        assert!(full_record_cost(&m, 1.0) >= with_raw + 100);
+        assert!(full_record_cost(&m, 1.0, &icm_core::RawRelevance::default()) >= with_raw + 100);
 
         // The embedding is never rendered, so it is not charged.
-        let before = full_record_cost(&m, 1.0);
+        let before = full_record_cost(&m, 1.0, &icm_core::RawRelevance::default());
         m.embedding = Some(vec![0.5; 1024]);
-        assert_eq!(full_record_cost(&m, 1.0), before);
+        assert_eq!(
+            full_record_cost(&m, 1.0, &icm_core::RawRelevance::default()),
+            before
+        );
     }
 
     #[test]
@@ -937,11 +1075,11 @@ mod pipeline_tests {
         embedder: Option<&dyn Embedder>,
         req: &RecallRequest<'_>,
     ) -> IcmResult<RecallOutcome> {
-        recall_with_depth(store, embedder, req, &full_record_cost, None, true)
+        recall_with_depth(store, embedder, req, &[], &full_record_cost, None, true)
     }
 
     /// Every hit costs 100 tokens: makes budget arithmetic exact.
-    fn flat_cost(_: &Memory, _: f32) -> usize {
+    fn flat_cost(_: &Memory, _: f32, _: &icm_core::RawRelevance) -> usize {
         100
     }
 
@@ -956,6 +1094,55 @@ mod pipeline_tests {
             now: None,
             expand_neighbors: false,
         }
+    }
+
+    /// Several queries (#522): what each finds is merged, each memory once,
+    /// and a memory both find ranks first. One query alone is unchanged.
+    #[test]
+    fn several_queries_merge_into_one_ranking() {
+        let s = store();
+        let redis = add(&s, "notes", "sessions are cached in redis", None);
+        let pg = add(&s, "notes", "billing runs on postgres", None);
+        let both = add(
+            &s,
+            "notes",
+            "redis fronts postgres for billing sessions",
+            None,
+        );
+        add(&s, "notes", "unrelated note about the weather", None);
+
+        let req = request("redis");
+        let out = recall_with_depth(
+            &s,
+            None,
+            &req,
+            &["postgres"],
+            &full_record_cost,
+            None,
+            false,
+        )
+        .unwrap();
+        let ids: Vec<&str> = out.hits.iter().map(|h| h.memory.id.as_str()).collect();
+        assert_eq!(ids.len(), 3, "{ids:?}");
+        assert_eq!(ids[0], both, "found by both queries: {ids:?}");
+        assert!(ids.contains(&redis.as_str()) && ids.contains(&pg.as_str()));
+
+        // A repeated or blank extra query changes nothing.
+        let alone = run(&s, None, &req).unwrap();
+        let again = recall_with_depth(
+            &s,
+            None,
+            &req,
+            &["redis", "  "],
+            &full_record_cost,
+            None,
+            false,
+        )
+        .unwrap();
+        let ids_of = |o: &RecallOutcome| -> Vec<String> {
+            o.hits.iter().map(|h| h.memory.id.clone()).collect()
+        };
+        assert_eq!(ids_of(&again), ids_of(&alone));
     }
 
     /// 120 memories that all match "deploy", each about 50 tokens long.
@@ -1059,7 +1246,7 @@ mod pipeline_tests {
         let mut req = request("deploy");
         req.limit = 200;
         req.max_tokens = Some(1050);
-        let out = recall_with_depth(&s, None, &req, &flat_cost, None, true).unwrap();
+        let out = recall_with_depth(&s, None, &req, &[], &flat_cost, None, true).unwrap();
         assert_eq!(out.hits.len(), 10);
         assert_eq!(out.used_tokens, 1000);
         assert!(out.hits.iter().all(|h| h.est_tokens == 100));
@@ -1389,21 +1576,21 @@ mod pipeline_tests {
 
         // Two ranked hits at 100 tokens each leave 50: not enough.
         req.max_tokens = Some(250);
-        let out = recall_with_depth(&s, None, &req, &flat_cost, None, true).unwrap();
+        let out = recall_with_depth(&s, None, &req, &[], &flat_cost, None, true).unwrap();
         assert_eq!(out.hits.len(), 2);
         assert!(out.hits.iter().all(|h| h.memory.id != neighbor));
         assert_eq!(out.used_tokens, 200);
 
         // 100 left: the neighbor fits, after the ranked hits.
         req.max_tokens = Some(300);
-        let out = recall_with_depth(&s, None, &req, &flat_cost, None, true).unwrap();
+        let out = recall_with_depth(&s, None, &req, &[], &flat_cost, None, true).unwrap();
         assert_eq!(out.hits.len(), 3);
         assert_eq!(out.hits[2].memory.id, neighbor);
         assert_eq!(out.used_tokens, 300);
 
         // A single oversized hit already overran the budget: nothing more.
         req.max_tokens = Some(40);
-        let out = recall_with_depth(&s, None, &req, &flat_cost, None, true).unwrap();
+        let out = recall_with_depth(&s, None, &req, &[], &flat_cost, None, true).unwrap();
         assert_eq!(out.hits.len(), 1);
     }
 
@@ -1415,7 +1602,7 @@ mod pipeline_tests {
         let mut req = request("deploy");
         req.limit = 200;
         req.max_tokens = Some(100_000);
-        let out = recall_with_depth(&s, None, &req, &flat_cost, Some("20"), true).unwrap();
+        let out = recall_with_depth(&s, None, &req, &[], &flat_cost, Some("20"), true).unwrap();
         assert_eq!(out.candidates, 20);
         assert_eq!(out.hits.len(), 20);
 

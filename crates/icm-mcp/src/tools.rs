@@ -180,6 +180,12 @@ pub fn tool_definitions(has_embedder: bool) -> Value {
                         "type": "string",
                         "description": "Natural language search query"
                     },
+                    "queries": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "maxItems": 8,
+                        "description": "More queries for the same call (tool arguments, project…), after `query`: each is ranked on its own and the results are merged into one ranked list, each memory once. Needs the default engine"
+                    },
                     "topic": {
                         "type": "string",
                         "description": "Filter by specific topic (optional)"
@@ -1508,6 +1514,9 @@ fn tool_recall(
     tool_recall_on(store, embedder, args, compact, engine, max_tokens)
 }
 
+/// Most queries one `icm_memory_recall` call ranks (the schema's maxItems).
+const MAX_RECALL_QUERIES: usize = 8;
+
 /// `icm_memory_recall` on a given engine. Below the `V2` dispatch, the
 /// legacy path is the pre-v2 code, unchanged.
 fn tool_recall_on(
@@ -1525,10 +1534,30 @@ fn tool_recall_on(
         tracing::warn!(error = %e, "auto-decay failed during recall");
     }
 
-    let query = match get_str(args, "query") {
-        Some(q) => q,
-        None => return ToolResult::error("missing required field: query".into()),
+    // `queries` (#522): several queries ranked apart and merged. `query`,
+    // when given too, is the first of them.
+    let mut queries: Vec<&str> = args
+        .get("queries")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|q| !q.trim().is_empty())
+                .take(MAX_RECALL_QUERIES)
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(q) = get_str(args, "query") {
+        queries.insert(0, q);
+    }
+    let Some(&query) = queries.first() else {
+        return ToolResult::error("missing required field: query (or queries)".into());
     };
+    let more: Vec<&str> = queries[1..].to_vec();
+    if !more.is_empty() && engine != RecallEngine::V2 {
+        return ToolResult::error("`queries` needs the default recall engine".into());
+    }
     // Clamp to the schema's advertised maximum (20) — the code previously
     // accepted up to 100, silently diverging from the published contract.
     let limit = get_i64(args, "limit", 5).clamp(1, 20) as usize;
@@ -1559,7 +1588,7 @@ fn tool_recall_on(
             now: None,
             expand_neighbors: true,
         };
-        return tool_recall_v2(store, embedder, &req, compact, format);
+        return tool_recall_v2(store, embedder, &req, &more, compact, format);
     }
 
     let project_filter = |m: &Memory| -> bool {
@@ -1715,6 +1744,7 @@ fn tool_recall_v2(
     store: &Store,
     embedder: Option<&dyn Embedder>,
     req: &RecallRequest<'_>,
+    more: &[&str],
     compact: bool,
     format: OutputFormat,
 ) -> ToolResult {
@@ -1724,23 +1754,33 @@ fn tool_recall_v2(
         return ToolResult::text(no_memories(format));
     }
     let shown = |score: f32| if embedder.is_some() { score } else { -1.0 };
-    let rendered_tokens = |mem: &Memory, score: f32| {
+    let rendered_tokens = |mem: &Memory, score: f32, raw: &icm_core::RawRelevance| {
         let text = match format {
             OutputFormat::Text => {
                 let mut text = String::new();
                 push_memory_output(&mut text, mem, shown(score), compact);
                 text
             }
-            OutputFormat::Json => memory_json(mem, shown(score), None).to_string(),
+            OutputFormat::Json => with_raw(memory_json(mem, shown(score), None), raw).to_string(),
         };
         icm_core::estimate_tokens(&text)
     };
-    let outcome = match req.run_with_cost(store, embedder, &rendered_tokens) {
+    let outcome = match req.run_many_with_cost(more, store, embedder, &rendered_tokens) {
         Ok(o) => o,
         Err(e) => return ToolResult::error(format!("search error: {e}")),
     };
     if outcome.hits.is_empty() {
         return ToolResult::text(no_memories(format));
+    }
+    if format == OutputFormat::Json {
+        // Beside the normalized `score`, what each arm measured (#521): a
+        // caller can tell "relevant" from "the best of what came back".
+        let records: Vec<Value> = outcome
+            .hits
+            .iter()
+            .map(|h| with_raw(memory_json(&h.memory, shown(h.score), None), &h.raw))
+            .collect();
+        return ToolResult::text(Value::Array(records).to_string());
     }
     let scored: Vec<(Memory, f32)> = outcome
         .hits
@@ -1748,6 +1788,22 @@ fn tool_recall_v2(
         .map(|h| (h.memory, shown(h.score)))
         .collect();
     ToolResult::text(render_memories(&scored, compact, format))
+}
+
+/// `record` with what each search arm measured (#521), when it did.
+fn with_raw(mut record: Value, raw: &icm_core::RawRelevance) -> Value {
+    if let Some(bm25) = raw.bm25 {
+        record["bm25"] = json!(rounded(bm25));
+    }
+    if let Some(similarity) = raw.similarity {
+        record["similarity"] = json!(rounded(similarity));
+    }
+    record
+}
+
+/// Three decimals, as in the text view.
+fn rounded(v: f32) -> f64 {
+    (f64::from(v) * 1000.0).round() / 1000.0
 }
 
 /// Result cap of `icm_memory_related`, as published in its schema.
@@ -5831,6 +5887,60 @@ description = "A test project"
             other,
             hidden,
         }
+    }
+
+    /// `queries` (#522): one call, several queries, one merged list.
+    #[test]
+    fn recall_takes_several_queries_in_one_call() {
+        if std::env::var_os("ICM_RECALL_ENGINE").is_some() {
+            return;
+        }
+        let g = graph();
+        let ids = |args: Value| -> Vec<Value> {
+            parsed(&call_tool(&g.store, None, "icm_memory_recall", &args, true))
+                .iter()
+                .map(|r| r["id"].clone())
+                .collect()
+        };
+        let both = ids(json!({
+            "queries": ["append-only persistence", "20 GB disk"],
+            "project": "",
+            "format": "json",
+        }));
+        assert!(both.contains(&json!(g.b.id)), "{both:?}");
+        assert!(both.contains(&json!(g.c.id)), "{both:?}");
+        let mut unique = both.clone();
+        unique.sort_by_key(|v| v.to_string());
+        unique.dedup();
+        assert_eq!(unique.len(), both.len(), "each memory once: {both:?}");
+
+        // Neither field: a clear error.
+        let result = call_tool(
+            &g.store,
+            None,
+            "icm_memory_recall",
+            &json!({"queries": []}),
+            true,
+        );
+        assert!(result.is_error, "{result:?}");
+    }
+
+    /// A JSON recall gives each record the BM25 its lexical match scored,
+    /// beside the per-query `score` (#521); no embedder, no similarity.
+    #[test]
+    fn recall_json_gives_the_raw_relevance() {
+        let g = graph();
+        let result = call_tool(
+            &g.store,
+            None,
+            "icm_memory_recall",
+            &json!({"query": "sessions Redis", "project": "alpha", "format": "json"}),
+            true,
+        );
+        let records = parsed(&result);
+        let a = records.iter().find(|r| r["id"] == json!(g.a.id)).unwrap();
+        assert!(a["bm25"].as_f64().is_some_and(|b| b > 0.0), "{a}");
+        assert!(a.get("similarity").is_none(), "{a}");
     }
 
     #[test]

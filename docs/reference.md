@@ -186,9 +186,13 @@ curl -s -X POST '127.0.0.1:11435/recall?format=json' \
   -d '{"query":"hello","topic":"t"}'
 ```
 
+`/recall` also takes `queries` (with or instead of `query`, up to 8): each query is ranked on its own and the rankings are merged by rank fusion, each memory once.
+
 Endpoints: `POST /store`, `POST /recall`, `POST /consolidate`, `GET /stats`, `GET /topics`, `GET /health`. Optional `--token <T>` enables `Authorization: Bearer <T>` on every request (health stays open as a liveness probe). Bound to whatever address you pass; `127.0.0.1:<port>` keeps the server localhost-only.
 
-The embedding model is loaded once instead of on every CLI call, so any scripting language can hit semantic recall with plain `curl`. Requires the `http-api` feature (enabled by default). Issue [#290](https://github.com/rtk-ai/icm/issues/290).
+`/recall` takes `"read_only": true` to record no access and apply no decay (what the prompt hook sends: a recall nobody asked for must not count as a use).
+
+The embedding model is loaded once instead of on every CLI call, so any scripting language can hit semantic recall with plain `curl`. The UserPromptSubmit hook uses it when `[recall] server_url` points at it: with the model warm, its recall is hybrid instead of keywords only, and it falls back to its own keyword recall when the server does not answer within `server_timeout_ms`. On 100 questions over 14 real sessions, hybrid recall of 10 memories answered about 6 more than keyword recall of 5. Requires the `http-api` feature (enabled by default). Issue [#290](https://github.com/rtk-ai/icm/issues/290).
 
 ## Dashboard
 
@@ -290,7 +294,7 @@ memories and memoirs.
 | Tool | Description |
 |------|-------------|
 | `icm_memory_store` | Store, merging into a near-identical memory of the same topic (cosine above 0.95, with embeddings) |
-| `icm_memory_recall` | Search by query, filter by topic / keyword / project; `format: "json"` returns records with their `id` and `related_ids` |
+| `icm_memory_recall` | Search by query, filter by topic / keyword / project; `format: "json"` returns records with their `id` and `related_ids`, and on the default engine `bm25` and `similarity` (what the lexical and vector search measured, before the per-query normalization of `score`; absent when that search did not match or ran); `queries: [...]` (up to 8 more) ranks several queries in one call and merges them into one list, each memory once |
 | `icm_memory_related` | List the memories linked to one memory (`id`), up to `depth` links away, within the project |
 | `icm_memory_update` | Edit a memory in-place (content, importance, keywords) |
 | `icm_memory_forget` | Delete a memory by ID |
@@ -544,8 +548,8 @@ ICM captures and reinjects memories through three hooks. Capture is rule-based; 
 | Layer | Status | LLM call | Hook command | Description |
 |-------|--------|----------|-------------|-------------|
 | Layer 0 | Implemented | only with `provider = "auto"` and an LLM CLI installed | `icm hook post` | Rule-based extraction from tool output |
-| Layer 1 | Implemented | none | `icm hook compact` | Extract from transcript before context compression |
-| Layer 2 | Implemented | none | `icm hook prompt` | Inject recalled memories on each user prompt (recall, not extraction) |
+| Layer 1 | Implemented | none; with `[extraction.conversation] enabled` and an LLM provider, one call per excerpt | `icm hook compact` | Extract from transcript before context compression; or, with `[extraction.conversation] enabled`, queue the conversation since the last fire for LLM extraction |
+| Layer 2 | Implemented | none; with `[extraction.conversation] in_session` and an LLM provider, one call per excerpt | `icm hook prompt` | Inject recalled memories on each user prompt; with `[extraction.conversation] in_session`, queue each full conversation excerpt for LLM extraction |
 
 All 3 layers are installed automatically by `icm init --mode hook`.
 

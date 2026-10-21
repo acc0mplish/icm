@@ -656,7 +656,9 @@ Config: ~/.config/icm/config.toml (loaded)
 
 [recall]
   enabled = true
-  limit = 15
+  limit = 5
+  server_url =
+  server_limit = 10
 
 [mcp]
   transport = stdio
@@ -1600,11 +1602,20 @@ min_score = 3.0
 max_facts = 10
 
 [recall]
-# Layer 2 : injection de contexte avant les sessions
+# Layer 2 : souvenirs injectes a chaque prompt (hook UserPromptSubmit)
 enabled = true
 
 # Maximum de souvenirs a injecter
-limit = 15
+limit = 5
+
+# Serveur `icm serve --http` a interroger d'abord (ex. "http://127.0.0.1:11435") :
+# il garde le modele d'embeddings charge, le rappel du hook est alors hybride
+# (mots-cles et sens). Sans reponse sous server_timeout_ms, le hook revient a
+# son rappel par mots-cles. Vide : desactive.
+server_url = ""
+server_token_env = ""
+server_limit = 10
+server_timeout_ms = 800
 
 [mcp]
 # Transport du serveur MCP

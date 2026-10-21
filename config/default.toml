@@ -101,6 +101,23 @@ store_raw = true
 # [extraction.summarizer]
 # provider = "auto"
 
+# LLM extraction from the conversation itself (what you and the agent
+# wrote), not only from tool output. Off by default: each excerpt is one
+# call to the extraction summarizer (needs a provider other than "none").
+[extraction.conversation]
+# At compaction and session end, queue the conversation not yet extracted.
+enabled = false
+# Also queue it during the session, on each prompt, as soon as a full
+# excerpt is written, instead of waiting for compaction.
+in_session = false
+# Characters per excerpt (one call each), excerpts kept per hook fire.
+excerpt_chars = 60000
+max_excerpts_per_fire = 12
+# Per-message caps, in characters.
+user_chars = 4000
+assistant_chars = 2000
+tool_chars = 1500
+
 # LLM summarizer used by `icm consolidate` / `consolidate-all` / `briefing`.
 # [consolidate.summarizer]
 #
@@ -149,11 +166,23 @@ store_raw = true
 # workspace_id = ""
 
 [recall]
-# Layer 2: context injection before sessions
+# Layer 2: memories injected on each prompt (UserPromptSubmit hook)
 enabled = true
 
 # Maximum memories to inject
-limit = 15
+limit = 5
+
+# Running `icm serve --http` to ask first (e.g. "http://127.0.0.1:11435").
+# It keeps the embedding model loaded, so the hook's recall is hybrid
+# (keywords and meaning) instead of keywords only, at no model-load cost.
+# No answer within server_timeout_ms, an error or no memory: the hook uses
+# its own keyword recall. Empty: off.
+server_url = ""
+# Variable holding the server's --token, if it has one.
+server_token_env = ""
+# Maximum memories to inject from the server.
+server_limit = 10
+server_timeout_ms = 800
 
 [wakeup]
 # SessionStart hook (Layer 1): wake-up pack of critical/high-importance

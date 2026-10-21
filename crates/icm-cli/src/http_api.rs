@@ -41,7 +41,9 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use icm_mcp::protocol::{JsonRpcMessage, JsonRpcResponse};
+use icm_mcp::protocol::{
+    HEADER_MISMATCH, JsonRpcMessage, JsonRpcResponse, UNSUPPORTED_PROTOCOL_VERSION,
+};
 
 use icm_core::{
     Embedder, Importance, MSG_NO_MEMORIES, Memory, MemoryStore, is_preference_topic,
@@ -149,7 +151,17 @@ impl OutputFormat {
 
 #[derive(Debug, Deserialize)]
 pub struct RecallReq {
+    /// Required unless `queries` is given.
+    #[serde(default)]
     query: String,
+    /// Several queries ranked apart and merged into one list, each memory
+    /// once (#522). `query`, when given too, is the first of them. v2 only.
+    #[serde(default)]
+    queries: Vec<String>,
+    /// `true`: no access recorded and no auto-decay, for a recall nobody
+    /// asked for (the prompt hook's, on every message). v2 engine only.
+    #[serde(default)]
+    read_only: bool,
     #[serde(default)]
     topic: Option<String>,
     #[serde(default)]
@@ -357,9 +369,15 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+/// Streamable HTTP keeps no `initialize` state between requests: a request
+/// that declares no version in `_meta` is answered on the one its
+/// `MCP-Protocol-Version` header names, when icm speaks it. A request whose
+/// declared version icm does not speak gets its JSON-RPC error with a 400,
+/// as the spec requires on HTTP.
 async fn handle_mcp(
     State(state): State<AppState>,
     Query(q): Query<McpQuery>,
+    headers: HeaderMap,
     Json(raw): Json<Value>,
 ) -> Response {
     let msg: JsonRpcMessage = match serde_json::from_value(raw) {
@@ -369,6 +387,24 @@ async fn handle_mcp(
             return Json(response).into_response();
         }
     };
+
+    let header = headers
+        .get("mcp-protocol-version")
+        .and_then(|v| v.to_str().ok());
+    let declared = icm_mcp::server::declared_protocol_version(&msg.params).map(str::to_owned);
+    // The header and `_meta` name the same thing on 2026-07-28: when both
+    // are there they must agree (`HeaderMismatch`, with a 400).
+    if let (Some(header), Some(declared)) = (header, declared.as_deref())
+        && header != declared
+    {
+        let response = JsonRpcResponse::err(
+            msg.id.clone().unwrap_or(Value::Null),
+            HEADER_MISMATCH,
+            format!("MCP-Protocol-Version header {header} does not match _meta version {declared}"),
+        );
+        return (StatusCode::BAD_REQUEST, Json(response)).into_response();
+    }
+    let mut header_version = header.and_then(icm_mcp::server::supported_protocol_version);
 
     let store = lock_store(&state);
     let mut calls_since_store = state
@@ -383,9 +419,29 @@ async fn handle_mcp(
         q.compact,
         state.auto_consolidate,
         &mut calls_since_store,
+        &mut header_version,
         state.mcp_instructions.as_deref(),
     ) {
-        Some(response) => Json(response).into_response(),
+        Some(response) => {
+            let unsupported = response
+                .error
+                .as_ref()
+                .is_some_and(|e| e.code == UNSUPPORTED_PROTOCOL_VERSION);
+            if unsupported {
+                return (StatusCode::BAD_REQUEST, Json(response)).into_response();
+            }
+            // Echo the version the request was answered on, when it named
+            // one (or `initialize` settled one); a version-less request
+            // gets no header rather than icm's default.
+            let version = declared
+                .as_deref()
+                .and_then(icm_mcp::server::supported_protocol_version)
+                .or(header_version);
+            match version {
+                Some(v) => ([("mcp-protocol-version", v)], Json(response)).into_response(),
+                None => Json(response).into_response(),
+            }
+        }
         None => StatusCode::NO_CONTENT.into_response(),
     }
 }
@@ -426,6 +482,14 @@ fn post_mcp_json_rpc(endpoint: &str, token: Option<&str>, body: &str) -> Result<
         }
         Err(ureq::Error::Status(code, resp)) => {
             let text = resp.into_string().unwrap_or_default();
+            // A JSON-RPC error sent with a 4xx (an unsupported protocol
+            // version) is the answer itself: pass it on to the client.
+            let is_rpc_error = serde_json::from_str::<Value>(&text)
+                .ok()
+                .is_some_and(|v| v.get("jsonrpc").is_some() && v.get("error").is_some());
+            if is_rpc_error {
+                return Ok(Some(text));
+            }
             anyhow::bail!("HTTP {code} from ICM daemon: {}", text.trim());
         }
         Err(e) => Err(e.into()),
@@ -454,7 +518,7 @@ async fn handle_recall(
         .map_err(anyhow::Error::from)
         .and_then(|engine| run_recall_with(&state, &req, engine, format));
     match results {
-        Ok(results) => render_recall(&results, format),
+        Ok((results, raw)) => render_recall(&results, &raw, format),
         Err(e) => err_response(StatusCode::BAD_REQUEST, &e.to_string(), format),
     }
 }
@@ -467,12 +531,19 @@ fn run_recall_with(
     req: &RecallReq,
     engine: RecallEngine,
     format: OutputFormat,
-) -> Result<Vec<(Memory, Option<f32>)>> {
+) -> Result<RecallResults> {
     match engine {
-        RecallEngine::Legacy => run_recall(state, req),
+        RecallEngine::Legacy if !req.queries.is_empty() => {
+            anyhow::bail!("`queries` needs the v2 engine")
+        }
+        RecallEngine::Legacy => run_recall(state, req).map(|results| (results, Vec::new())),
         RecallEngine::V2 => run_recall_v2(state, req, format),
     }
 }
+
+/// Recalled memories with their score, and what each search arm measured
+/// for them (empty on the legacy engine).
+type RecallResults = (Vec<(Memory, Option<f32>)>, Vec<icm_core::RawRelevance>);
 
 /// The renderer format behind a response format.
 fn recall_format_of(format: OutputFormat) -> RecallFormat {
@@ -481,6 +552,9 @@ fn recall_format_of(format: OutputFormat) -> RecallFormat {
         OutputFormat::Json => RecallFormat::Json,
     }
 }
+
+/// Most queries one `/recall` request ranks.
+const MAX_QUERIES: usize = 8;
 
 /// `limit` of a v2 request: default and ceiling. Without a budget they are
 /// the legacy ones. With a budget the budget does the cutting and `limit`
@@ -495,14 +569,21 @@ const V2_MAX_LIMIT_WITH_BUDGET: usize = 500;
 /// shape: a `score` is rendered only when the server has an embedder (a
 /// keyword-only ranking has no similarity to report). Under `max_tokens`,
 /// the body rendered in `format` fits the budget.
-fn run_recall_v2(
-    state: &AppState,
-    req: &RecallReq,
-    format: OutputFormat,
-) -> Result<Vec<(Memory, Option<f32>)>> {
-    if req.query.trim().is_empty() {
-        anyhow::bail!("missing required field: query");
+fn run_recall_v2(state: &AppState, req: &RecallReq, format: OutputFormat) -> Result<RecallResults> {
+    let mut queries: Vec<&str> = Vec::new();
+    if !req.query.trim().is_empty() {
+        queries.push(&req.query);
     }
+    queries.extend(
+        req.queries
+            .iter()
+            .map(String::as_str)
+            .filter(|q| !q.trim().is_empty())
+            .take(MAX_QUERIES),
+    );
+    let Some(&first) = queries.first() else {
+        anyhow::bail!("missing required field: query (or queries)");
+    };
     let now = match req.now.as_deref() {
         Some(raw) => Some(icm_core::parse_instant(raw).map_err(|e| anyhow::anyhow!("now: {e}"))?),
         None => None,
@@ -517,7 +598,7 @@ fn run_recall_v2(
     let rendered_as = recall_format_of(format);
     let envelope_tokens = crate::recall_header_tokens(with_score, rendered_as);
     let request = RecallRequest {
-        query: &req.query,
+        query: first,
         limit: req.limit.unwrap_or(default_limit).clamp(1, max_limit),
         max_tokens: req.max_tokens.map(|b| b.saturating_sub(envelope_tokens)),
         topic: req.topic.as_deref(),
@@ -528,14 +609,19 @@ fn run_recall_v2(
     };
 
     let store = lock_store(state);
-    let outcome = request.run_with_cost(&store, state.embedder_ref(), &|m, score| {
-        crate::rendered_recall_tokens(m, with_score.then_some(score), rendered_as)
-    })?;
+    let cost = |m: &Memory, score: f32, raw: &icm_core::RawRelevance| {
+        crate::rendered_recall_tokens_raw(m, with_score.then_some(score), raw, rendered_as)
+    };
+    let outcome = if req.read_only {
+        request.run_many_read_only(&queries[1..], &store, state.embedder_ref(), &cost)?
+    } else {
+        request.run_many_with_cost(&queries[1..], &store, state.embedder_ref(), &cost)?
+    };
     Ok(outcome
         .hits
         .into_iter()
-        .map(|h| (h.memory, with_score.then_some(h.score)))
-        .collect())
+        .map(|h| ((h.memory, with_score.then_some(h.score)), h.raw))
+        .unzip())
 }
 
 /// Recall logic mirrored from `icm-mcp::tools::tool_recall` but
@@ -618,7 +704,11 @@ where
     Ok(rows.into_iter().map(|m| (m, None)).collect())
 }
 
-fn render_recall(results: &[(Memory, Option<f32>)], format: OutputFormat) -> Response {
+fn render_recall(
+    results: &[(Memory, Option<f32>)],
+    raw: &[icm_core::RawRelevance],
+    format: OutputFormat,
+) -> Response {
     if results.is_empty() {
         return text_response(MSG_NO_MEMORIES, format);
     }
@@ -631,14 +721,16 @@ fn render_recall(results: &[(Memory, Option<f32>)], format: OutputFormat) -> Res
                 format,
             ),
         },
-        OutputFormat::Json => match recall_format::render(results, RecallFormat::Json) {
-            Ok(body) => json_string_response(body),
-            Err(e) => err_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("json render failed: {e}"),
-                format,
-            ),
-        },
+        OutputFormat::Json => {
+            match recall_format::render_with_raw(results, raw, RecallFormat::Json) {
+                Ok(body) => json_string_response(body),
+                Err(e) => err_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("json render failed: {e}"),
+                    format,
+                ),
+            }
+        }
     }
 }
 
@@ -694,7 +786,7 @@ async fn handle_store(
         Ok(id) => {
             let mut stored = mem;
             stored.id = id;
-            render_recall(&[(stored, None)], format)
+            render_recall(&[(stored, None)], &[], format)
         }
         Err(e) => err_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -809,7 +901,7 @@ async fn handle_consolidate(
                     .map(|m| (m, None))
                     .collect(),
             };
-            let mut resp = render_recall(&shown, format);
+            let mut resp = render_recall(&shown, &[], format);
             // Additive headers.
             for (name, value) in [
                 ("x-icm-consolidated", run.replaced),
@@ -1649,6 +1741,61 @@ mod tests {
         assert_eq!(rows(&body).len(), 12);
     }
 
+    /// `queries` (#522) without `query`: each ranked, merged, each memory
+    /// once; neither field is a 400.
+    #[tokio::test]
+    async fn recall_takes_several_queries() {
+        if !recall_env_is_clean() {
+            return;
+        }
+        let store = Store::in_memory_with_dims(TEST_DIMS).unwrap();
+        for text in [
+            "sessions are cached in redis",
+            "billing runs on postgres",
+            "redis fronts postgres for billing",
+        ] {
+            store
+                .store(Memory::new("notes".into(), text.into(), Importance::Medium))
+                .unwrap();
+        }
+        let state = test_state(store, false);
+        let (status, body) = post_recall(&state, json!({"queries": ["redis", "postgres"]})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let got = ids(&rows(&body));
+        assert_eq!(got.len(), 3, "{body}");
+        let (status, _) = post_recall(&state, json!({"queries": ["  "]})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// A read-only recall (the prompt hook's) records no access: what it
+    /// happens to surface must keep decaying. A plain recall still does.
+    #[tokio::test]
+    async fn recall_read_only_records_no_access() {
+        if !recall_env_is_clean() {
+            return;
+        }
+        let state = seeded_state();
+        let accessed = |state: &AppState, ids: &[String]| -> u32 {
+            let store = lock_store(state);
+            ids.iter()
+                .map(|id| store.get(id).unwrap().unwrap().access_count)
+                .sum()
+        };
+
+        let (_, body) = post_recall(
+            &state,
+            json!({"query": "deploy", "engine": "v2", "read_only": true}),
+        )
+        .await;
+        let hit = ids(&rows(&body));
+        assert_eq!(hit.len(), 5);
+        assert_eq!(accessed(&state, &hit), 0);
+
+        let (_, body) = post_recall(&state, json!({"query": "deploy", "engine": "v2"})).await;
+        let hit = ids(&rows(&body));
+        assert!(accessed(&state, &hit) > 0);
+    }
+
     /// The legacy engine, on request, runs the pre-v2 code and returns what
     /// `search_hybrid` ranks.
     #[tokio::test]
@@ -1684,6 +1831,7 @@ mod tests {
         let got: Vec<String> =
             run_recall_with(&state, &req, RecallEngine::Legacy, OutputFormat::Json)
                 .unwrap()
+                .0
                 .into_iter()
                 .map(|(m, _)| m.id)
                 .collect();
@@ -1750,7 +1898,12 @@ mod tests {
         let legacy = json!({"query": "deploy release", "engine": "legacy"});
         let (_, v2_json) = post_recall(&state, v2.clone()).await;
         let (_, legacy_json) = post_recall(&state, legacy.clone()).await;
-        assert_eq!(keys(&v2_json), keys(&legacy_json));
+        // v2 adds what each search arm measured (#521), nothing else.
+        let v2_keys: Vec<String> = keys(&v2_json)
+            .into_iter()
+            .filter(|k| k != "bm25" && k != "similarity")
+            .collect();
+        assert_eq!(v2_keys, keys(&legacy_json));
         assert!(keys(&v2_json).contains(&"score".to_string()));
         let (_, v2_toon) = post_recall_as(&state, v2.clone(), "toon").await;
         let (_, legacy_toon) = post_recall_as(&state, legacy.clone(), "toon").await;
@@ -1774,7 +1927,12 @@ mod tests {
         let state = test_state(store, false);
         let (_, v2_json) = post_recall(&state, v2.clone()).await;
         let (_, legacy_json) = post_recall(&state, legacy.clone()).await;
-        assert_eq!(keys(&v2_json), keys(&legacy_json));
+        // v2 adds what each search arm measured (#521), nothing else.
+        let v2_keys: Vec<String> = keys(&v2_json)
+            .into_iter()
+            .filter(|k| k != "bm25" && k != "similarity")
+            .collect();
+        assert_eq!(v2_keys, keys(&legacy_json));
         assert!(!keys(&v2_json).contains(&"score".to_string()));
         let (_, v2_toon) = post_recall_as(&state, v2, "toon").await;
         let (_, legacy_toon) = post_recall_as(&state, legacy, "toon").await;
