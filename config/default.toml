@@ -80,10 +80,10 @@ prune_threshold = 0.1
 enabled = true
 
 # Minimum keyword score to keep a fact
-min_score = 3.0
+min_score = 2.0
 
 # Maximum facts per extraction pass
-max_facts = 10
+max_facts = 20
 
 # Extract every N PostToolUse hook fires (i.e. every N tool calls in a
 # Claude Code / Gemini / Codex / Copilot session). Lower = more
