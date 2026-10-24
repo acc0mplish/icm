@@ -123,7 +123,9 @@ tool_chars = 1500
 #
 # provider:
 #   "none"                          — no LLM, lexical join (default)
-#   "auto"                          — detect the invoking tool's CLI; never
+#   "auto"                          — the CLI of the agent that fired the
+#                                     hook (Claude Code, Codex, Gemini);
+#                                     "none" under any other agent; never
 #                                     picks an API-key provider
 #   "claude" | "codex" | "gemini"   — the CLI you are logged into (no key)
 #   "ollama"                        — local Ollama daemon (model required)

@@ -170,9 +170,10 @@ pub struct ExtractionConfig {
     /// the configured LLM CLI. See `icm extract-pending` and the
     /// SessionEnd async trigger.
     ///
-    /// Defaults to `auto`: ICM detects an installed LLM CLI and uses the
-    /// async queue path. With no CLI installed, `extract-pending` drains
-    /// via a batched fastembed pass. Set `provider = "none"` explicitly
+    /// Defaults to `auto`: hooks use the async queue path, and the drain
+    /// hands it to the CLI of the agent that fired the hook (Claude Code,
+    /// Codex, Gemini). Under any other agent, or with that CLI missing,
+    /// `extract-pending` drains via a batched fastembed pass. Set `provider = "none"` explicitly
     /// to force the legacy per-fire inline fastembed behavior.
     pub summarizer: SummarizerConfig,
 }
