@@ -2240,6 +2240,7 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let cfg = config::load_config()?;
+    extract::set_limits(cfg.extraction.min_score, cfg.extraction.max_facts);
 
     #[cfg(feature = "http-api")]
     if let Commands::Serve {
@@ -2303,6 +2304,8 @@ fn main() -> Result<()> {
         }
     }
     let cli_db: Option<PathBuf> = cli.db.into_iter().next();
+    let init_db = cli_db.clone();
+    let init_no_embeddings = cli.no_embeddings;
     // `db_path` centralizes hierarchical resolution (issue #257): --db flag,
     // $ICM_DB env var, global config, project-local .icm/, then the platform
     // default. It feeds the extract-pending worker lock (#322), doctor/repair/
@@ -2832,7 +2835,15 @@ fn main() -> Result<()> {
             force,
             per_project,
             with_codex_post_hook,
-        } => cmd_init(mode, force, per_project, with_codex_post_hook, &db_path),
+        } => cmd_init(
+            mode,
+            force,
+            per_project,
+            with_codex_post_hook,
+            &db_path,
+            init_db.as_deref(),
+            init_no_embeddings,
+        ),
         // Doctor, Repair and Backup are dispatched before `open_store` above;
         // these arms exist only for match exhaustiveness and are unreachable.
         Commands::Doctor => unreachable!("dispatched before open_store"),
@@ -5440,7 +5451,8 @@ fn build_hook_start_pack(store: &Store, stdin_json: &str, max_tokens: usize) -> 
         project: project_name.as_deref(),
         max_tokens: wake_up_budget,
         format: icm_core::WakeUpFormat::Markdown,
-        include_preferences: true,
+        // The snapshot above already lists them: printed twice otherwise.
+        include_preferences: snapshot.is_empty(),
     };
 
     // Compute the live static pack first, so its emptiness reflects the CURRENT
@@ -5845,6 +5857,8 @@ fn cmd_init(
     per_project: bool,
     with_codex_post_hook: bool,
     db_path: &Path,
+    cli_db: Option<&Path>,
+    no_embeddings: bool,
 ) -> Result<()> {
     let icm_bin = std::env::current_exe().context("cannot determine icm binary path")?;
     let icm_bin_str = portable_command_path(&icm_bin);
@@ -6905,6 +6919,14 @@ description: ICM persistent memory — /{name}
             } else {
                 println!("[project] .icm/ already exists at {}", root.display());
             }
+        }
+    }
+
+    // The hooks and MCP server registered above run without --db /
+    // --no-embeddings: persist them, or init silently ignored both.
+    if cli_db.is_some() || no_embeddings {
+        for note in config::persist_init_overrides(cli_db, no_embeddings)? {
+            println!("[config] {note}");
         }
     }
 
@@ -13920,6 +13942,11 @@ mod hook_start_tests {
             "wake-up section dropped from concatenated pack: {pack}",
         );
         assert!(pack.contains("SQLite"));
+        assert_eq!(
+            pack.matches("French").count(),
+            1,
+            "preference printed by both the snapshot and the wake-up: {pack}",
+        );
     }
 
     /// Snapshot must NOT appear when only decisions exist (no

@@ -80,10 +80,10 @@ prune_threshold = 0.1
 enabled = true
 
 # Minimum keyword score to keep a fact
-min_score = 3.0
+min_score = 2.0
 
 # Maximum facts per extraction pass
-max_facts = 10
+max_facts = 20
 
 # Extract every N PostToolUse hook fires (i.e. every N tool calls in a
 # Claude Code / Gemini / Codex / Copilot session). Lower = more
@@ -123,7 +123,9 @@ tool_chars = 1500
 #
 # provider:
 #   "none"                          — no LLM, lexical join (default)
-#   "auto"                          — detect the invoking tool's CLI; never
+#   "auto"                          — the CLI of the agent that fired the
+#                                     hook (Claude Code, Codex, Gemini);
+#                                     "none" under any other agent; never
 #                                     picks an API-key provider
 #   "claude" | "codex" | "gemini"   — the CLI you are logged into (no key)
 #   "ollama"                        — local Ollama daemon (model required)
