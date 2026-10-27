@@ -17,6 +17,10 @@ default = ["backend-sqlite"]
 # default; the remote backends are opt-in extra deps.
 backend-sqlite = ["dep:rusqlite", "dep:sqlite-vec", "dep:zerocopy"]
 
+# Opt-in Korean query analysis for SQLite v2 recall. Keeps the existing
+# FTS schema so databases remain usable by older ICM binaries.
+korean = ["backend-sqlite", "dep:lindera", "dep:unicode-normalization"]
+
 # Opt-in network-accessible PostgreSQL backend (issue #301). Lets several
 # ICM processes / Kubernetes replicas share one memory store, which a
 # node-local SQLite file cannot do. Mutually exclusive with
@@ -47,6 +51,8 @@ ulid = { workspace = true }
 rusqlite = { workspace = true, optional = true }
 sqlite-vec = { workspace = true, optional = true }
 zerocopy = { workspace = true, optional = true }
+lindera = { version = "=6.2.0", default-features = false, features = ["embed-ko-dic"], optional = true }
+unicode-normalization = { version = "0.1", optional = true }
 
 # PostgreSQL backend (opt-in). The blocking `postgres` client matches the
 # store's synchronous trait surface exactly, so no async runtime or

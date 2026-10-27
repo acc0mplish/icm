@@ -23,6 +23,8 @@ fn icm(
     cmd.env("HOME", home)
         .env("ICM_NO_EMBEDDINGS", "1")
         .env_remove("ICM_DB")
+        .env_remove("ICM_DB_BACKEND")
+        .env_remove("ICM_RECALL_ENGINE")
         .env_remove("ICM_CONFIG")
         .env_remove("XDG_DATA_HOME")
         .env_remove("XDG_CONFIG_HOME");
@@ -115,6 +117,52 @@ fn hook_prompt_injects_five_memories_by_default() {
     let tmp = tempfile::tempdir().unwrap();
     let db = seeded(tmp.path());
     assert_eq!(injected(tmp.path(), &db, None), 5);
+}
+
+#[cfg(feature = "korean")]
+#[test]
+fn hook_prompt_recalls_korean_particle_variants() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("memories.db");
+    let db = db.to_str().unwrap();
+    let out = icm(
+        tmp.path(),
+        None,
+        &[
+            "--db",
+            db,
+            "store",
+            "-t",
+            "decisions-myproj",
+            "-c",
+            "사건은 2023년에 발생했습니다",
+        ],
+        None,
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for query in ["사건", "사건을", "발생"] {
+        let input = serde_json::json!({"user_message": query, "cwd": "/work/myproj"});
+        let out = icm(
+            tmp.path(),
+            None,
+            &["--db", db, "hook", "prompt"],
+            Some(&input.to_string()),
+        );
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            text.contains("사건은 2023년에 발생했습니다"),
+            "query={query}: {text}"
+        );
+    }
 }
 
 /// A running `icm serve --http` on a free loopback port, over `db`, killed

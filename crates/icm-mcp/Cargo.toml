@@ -16,6 +16,7 @@ embeddings-dynamic = ["embeddings", "icm-core/embeddings-dynamic"]
 # Storage backend selection is driven by the binary crate (icm-cli); these
 # pass-through features let `cargo test -p icm-mcp` pick one directly.
 backend-sqlite = ["icm-store/backend-sqlite"]
+korean = ["backend-sqlite", "icm-store/korean"]
 postgres = ["icm-store/postgres"]
 opensearch = ["icm-store/opensearch"]
 

@@ -451,6 +451,8 @@ mod cache;
 mod connection;
 mod embedding_state;
 mod hooks;
+#[cfg(feature = "korean")]
+mod korean;
 mod rows;
 
 // Shared helpers live in submodules; re-export so `use super::*` in
