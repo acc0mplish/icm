@@ -30,10 +30,20 @@
 <a id="quickstart"></a>
 ## 빠른 시작
 
+이 포크의 소스 빌드는 한국어 SQLite 검색을 기본 활성화합니다. Rust와
+Cargo로 설치하세요:
+
 ```bash
-brew tap rtk-ai/tap && brew install icm    # or: curl -fsSL https://raw.githubusercontent.com/rtk-ai/icm/main/install.sh | sh
-icm init                                   # instructions, skills and hooks for every agent it detects
+cargo install --locked --git https://github.com/acc0mplish/icm --branch main icm-cli
+icm config   # Korean query analysis가 포함됐는지 확인
+icm init     # 감지된 에이전트의 지침, 스킬, 훅 설정
 ```
+
+Cargo는 기본적으로 `~/.cargo/bin`에 설치합니다. 다른 `icm`이 설치되어
+있다면 `PATH` 순서를 확인하세요. [설치](#install)의 원본 저장소 설치
+명령은 이 포크의 한국어 기능이 없는 바이너리를 설치할 수 있습니다.
+적용 범위와 제한, `--no-default-features` 빌드는
+[한국어 검색 설명](docs/korean-recall.md)을 확인하세요.
 
 설정은 이것으로 끝입니다. Claude Code, Codex, Gemini CLI 또는 Copilot CLI에서 새 세션을 열면, 에이전트는 현재 있는 프로젝트의 가장 중요한 메모리(`myapp`이라는 저장소의 `decisions-myapp`처럼 토픽에 저장소 이름이 들어 있는 메모리와 사용자의 선호)를 모은 짧은 팩을 가지고 시작하며, 보내는 프롬프트마다 관련된 메모리를 받습니다. 에이전트가 도구 출력에서 배운 내용은 큐에 쌓이고, 이 큐는 각 Claude Code 세션이 끝날 때 메모리로 변환됩니다. 다른 도구에서는 `icm extract-pending`을 실행하세요(예를 들어 cron 작업으로).
 

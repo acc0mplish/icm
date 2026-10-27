@@ -227,7 +227,7 @@ icm stats
 echo "The parser uses Pratt algorithm" | icm extract -p my-project
 ```
 
-For the optional Korean-aware SQLite v2 search build, see
+For Korean-aware SQLite v2 search in this fork, see
 [Korean recall](korean-recall.md).
 
 ### Memoirs (permanent knowledge graphs)

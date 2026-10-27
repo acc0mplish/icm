@@ -27,10 +27,20 @@ Tell Claude Code how your project handles auth on Monday, and Tuesday's Gemini C
 
 ## Quickstart
 
+This fork enables Korean-aware SQLite recall by default in source builds.
+Install it with Rust and Cargo:
+
 ```bash
-brew tap rtk-ai/tap && brew install icm    # or: curl -fsSL https://raw.githubusercontent.com/rtk-ai/icm/main/install.sh | sh
-icm init                                   # instructions, skills and hooks for every agent it detects
+cargo install --locked --git https://github.com/acc0mplish/icm --branch main icm-cli
+icm config   # check that Korean query analysis is compiled in
+icm init     # instructions, skills and hooks for every agent it detects
 ```
+
+Cargo installs to `~/.cargo/bin` by default; check your `PATH` if another `icm`
+is installed. The upstream installers in [Install](#install) install upstream
+builds, which may not contain this fork's Korean support. See
+[Korean recall](docs/korean-recall.md) for scope, limitations, and builds with
+`--no-default-features`.
 
 That is the whole setup. Open a new session in Claude Code, Codex, Gemini CLI or Copilot CLI: your agent now starts with a short pack of the most important memories of the project it is in (those whose topic carries the repository's name, such as `decisions-myapp` in a repository called `myapp`, plus your preferences) and receives the memories relevant to each prompt you send. What it learns from its tool output is queued, and the queue is turned into memories at the end of each Claude Code session; with the other tools, run `icm extract-pending` (from a cron job, for instance).
 
