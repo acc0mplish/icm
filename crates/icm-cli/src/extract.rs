@@ -1805,6 +1805,24 @@ mod tests {
             .unwrap()
     }
 
+    #[cfg(feature = "korean")]
+    #[test]
+    fn test_recall_context_korean_is_read_only() {
+        let store = Store::in_memory().unwrap();
+        let id = remember(&store, "notes", "사건은 2023년에 발생했습니다");
+        let before = store.get(&id).unwrap().unwrap();
+        for text in ["사건", "사건을", "발생"] {
+            let context = recall_context_on(&store, text, None, 5, RecallEngine::V2).unwrap();
+            assert!(
+                context.contains("사건은 2023년에 발생했습니다"),
+                "{text:?}: {context}"
+            );
+        }
+        let after = store.get(&id).unwrap().unwrap();
+        assert_eq!(after.access_count, before.access_count);
+        assert_eq!(after.last_accessed, before.last_accessed);
+    }
+
     /// v2 ranks by how well a memory matches; the legacy full-text search
     /// needed every query word and dropped the partial match.
     #[test]

@@ -3703,6 +3703,35 @@ mod tests {
         assert!(recall_result.content[0].text.contains("Rust"));
     }
 
+    #[cfg(feature = "korean")]
+    #[test]
+    fn test_korean_recall_without_embeddings() {
+        let store = test_store();
+        let stored = call_tool(
+            &store,
+            None,
+            "icm_memory_store",
+            &json!({"topic": "test-project", "content": "사건은 2023년에 발생했습니다"}),
+            false,
+        );
+        assert!(!stored.is_error);
+        for query in ["사건", "사건을", "발생"] {
+            let result = call_tool(
+                &store,
+                None,
+                "icm_memory_recall",
+                &json!({"query": query, "project": ""}),
+                false,
+            );
+            assert!(!result.is_error);
+            assert!(
+                result.content[0]
+                    .text
+                    .contains("사건은 2023년에 발생했습니다")
+            );
+        }
+    }
+
     /// Audit regression: a 64 KB raw_excerpt was dumped in full for every
     /// recall hit, flooding the client LLM. The recall view must cap it.
     #[test]

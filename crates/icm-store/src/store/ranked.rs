@@ -79,12 +79,15 @@ impl SqliteStore {
             return Ok(Vec::new());
         }
 
-        // OR-joined, same reasoning as `search_hybrid`.
+        // Preserve the original FTS expression. The optional Korean path
+        // adds bounded query-side prefixes without changing the DB schema.
         let match_expr = sanitize_fts_query_any(q.text);
+        let (match_expr, korean_terms) = korean_query(q.text, match_expr);
         let embedding = q.embedding.filter(|e| !e.is_empty());
 
         let mut depth = q.depth.clamp(MIN_DEPTH, MAX_DEPTH);
         let mut fts = self.ranked_fts_arm(&match_expr, depth, keep)?;
+        let mut korean = self.ranked_korean_arm(&korean_terms, depth, keep)?;
         let mut vec = self.ranked_vec_arm(embedding, depth, keep)?;
 
         // A filter can discard most of a saturated arm. Fetch deeper rather
@@ -92,8 +95,8 @@ impl SqliteStore {
         // `depth`.
         for _ in 0..MAX_WIDENINGS {
             if depth >= MAX_DEPTH
-                || !(fts.saturated || vec.saturated)
-                || union_len(&fts.kept, &vec.kept) >= q.limit
+                || !(fts.saturated || korean.saturated || vec.saturated)
+                || union_len(&fts.kept, &korean.kept, &vec.kept) >= q.limit
             {
                 break;
             }
@@ -101,11 +104,25 @@ impl SqliteStore {
             if fts.saturated {
                 fts = self.ranked_fts_arm(&match_expr, depth, keep)?;
             }
+            if korean.saturated {
+                korean = self.ranked_korean_arm(&korean_terms, depth, keep)?;
+            }
             if vec.saturated {
                 vec = self.ranked_vec_arm(embedding, depth, keep)?;
             }
         }
 
+        // Combine the Korean substring candidates inside the lexical arm,
+        // so enabling them does not add another full-weight arm alongside
+        // vectors or dates. Keep actual FTS ranks and BM25 provenance: a
+        // substring-only hit must not pretend to have an FTS score.
+        let fts_ranks: HashMap<String, u32> = fts
+            .kept
+            .iter()
+            .enumerate()
+            .map(|(i, m)| (m.id.clone(), u32::try_from(i + 1).unwrap_or(u32::MAX)))
+            .collect();
+        let fts = fuse_lexical(fts, korean);
         let fts_ids: Vec<String> = fts.kept.iter().map(|m| m.id.clone()).collect();
         let vec_ids: Vec<String> = vec.kept.iter().map(|m| m.id.clone()).collect();
 
@@ -176,7 +193,7 @@ impl SqliteStore {
                 hits.push(RankedHit {
                     memory,
                     score: hit.score,
-                    fts_rank: rank(0),
+                    fts_rank: fts_ranks.get(&hit.id).copied(),
                     vec_rank: rank(1),
                     time_rank: rank(2),
                     raw,
@@ -254,6 +271,77 @@ impl SqliteStore {
             raw,
             saturated,
         })
+    }
+
+    /// Find Korean content surfaces occurring inside a unicode61 token.
+    /// This bounded candidate scan is deliberately separate from BM25: an
+    /// unindexed substring match must not be reported as an FTS score.
+    #[cfg(feature = "korean")]
+    fn ranked_korean_arm(
+        &self,
+        terms: &[String],
+        depth: usize,
+        keep: &dyn Fn(&Memory) -> bool,
+    ) -> IcmResult<Arm> {
+        if terms.is_empty() {
+            return Ok(Arm::empty());
+        }
+
+        let mut patterns = Vec::new();
+        let mut groups = Vec::new();
+        for term in terms {
+            let mut forms = Vec::new();
+            for variant in super::korean::variants(term) {
+                patterns.push(format!("%{}%", escape_like_wildcards(&variant)));
+                let param = patterns.len();
+                forms.push(format!(
+                    "(summary LIKE ?{param} ESCAPE '\\' OR topic LIKE ?{param} ESCAPE '\\' \
+                     OR keywords LIKE ?{param} ESCAPE '\\')"
+                ));
+            }
+            groups.push(format!("({})", forms.join(" OR ")));
+        }
+        let score = groups
+            .iter()
+            .map(|group| format!("CASE WHEN {group} THEN 1 ELSE 0 END"))
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let sql = format!(
+            "SELECT id, created_at, updated_at, last_accessed, access_count, weight, \
+                    topic, summary, raw_excerpt, keywords, importance, source_type, \
+                    source_data, related_ids, NULL \
+             FROM memories WHERE {} \
+             ORDER BY ({score}) DESC, weight DESC, id ASC LIMIT ?{}",
+            groups.join(" OR "),
+            patterns.len() + 1
+        );
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = patterns
+            .into_iter()
+            .map(|pattern| Box::new(pattern) as Box<dyn rusqlite::types::ToSql>)
+            .collect();
+        params.push(Box::new(depth as i64));
+        let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = self.conn.prepare(&sql).map_err(db_err)?;
+        let rows = stmt
+            .query_map(refs.as_slice(), row_to_memory)
+            .map_err(db_err)?;
+        let found = collect_rows(rows)?;
+        let saturated = found.len() >= depth;
+        Ok(Arm {
+            kept: found.into_iter().filter(|memory| keep(memory)).collect(),
+            raw: HashMap::new(),
+            saturated,
+        })
+    }
+
+    #[cfg(not(feature = "korean"))]
+    fn ranked_korean_arm(
+        &self,
+        _terms: &[String],
+        _depth: usize,
+        _keep: &dyn Fn(&Memory) -> bool,
+    ) -> IcmResult<Arm> {
+        Ok(Arm::empty())
     }
 
     /// Vector arm: KNN order, at most `depth` rows, filtered by `keep`.
@@ -344,6 +432,54 @@ impl SqliteStore {
     }
 }
 
+#[cfg(feature = "korean")]
+fn korean_query(query: &str, original: String) -> (String, Vec<String>) {
+    let terms = super::korean::terms(query);
+    (super::korean::expand_fts(original, &terms), terms)
+}
+
+#[cfg(not(feature = "korean"))]
+fn korean_query(_query: &str, original: String) -> (String, Vec<String>) {
+    (original, Vec::new())
+}
+
+/// Fuse the two lexical lists before combining them with other modalities.
+fn fuse_lexical(fts: Arm, korean: Arm) -> Arm {
+    if korean.kept.is_empty() {
+        return fts;
+    }
+    let fts_ids: Vec<String> = fts.kept.iter().map(|m| m.id.clone()).collect();
+    let korean_ids: Vec<String> = korean.kept.iter().map(|m| m.id.clone()).collect();
+    let fused = rrf_fuse(
+        &[
+            RankedList {
+                name: "fts",
+                ids: &fts_ids,
+                weight: 1.0,
+            },
+            RankedList {
+                name: "korean-substring",
+                ids: &korean_ids,
+                weight: 1.0,
+            },
+        ],
+        RRF_K,
+    );
+    let mut by_id: HashMap<String, Memory> =
+        HashMap::with_capacity(fts_ids.len() + korean_ids.len());
+    for memory in fts.kept.into_iter().chain(korean.kept) {
+        by_id.entry(memory.id.clone()).or_insert(memory);
+    }
+    Arm {
+        kept: fused
+            .into_iter()
+            .filter_map(|hit| by_id.remove(&hit.id))
+            .collect(),
+        raw: fts.raw,
+        saturated: fts.saturated || korean.saturated,
+    }
+}
+
 /// Position of each id in a ranked list.
 fn positions(ids: &[String]) -> HashMap<&str, usize> {
     ids.iter()
@@ -352,10 +488,14 @@ fn positions(ids: &[String]) -> HashMap<&str, usize> {
         .collect()
 }
 
-/// Distinct memories across both arms.
-fn union_len(fts: &[Memory], vec: &[Memory]) -> usize {
-    let seen: HashSet<&str> = fts.iter().map(|m| m.id.as_str()).collect();
-    seen.len() + vec.iter().filter(|m| !seen.contains(m.id.as_str())).count()
+/// Distinct memories across the two lexical candidate lists and vector arm.
+fn union_len(fts: &[Memory], korean: &[Memory], vec: &[Memory]) -> usize {
+    fts.iter()
+        .chain(korean)
+        .chain(vec)
+        .map(|m| m.id.as_str())
+        .collect::<HashSet<_>>()
+        .len()
 }
 
 #[cfg(test)]
@@ -428,6 +568,94 @@ mod tests {
 
     fn ids(hits: &[RankedHit]) -> Vec<&str> {
         hits.iter().map(|h| h.memory.id.as_str()).collect()
+    }
+
+    #[cfg(feature = "korean")]
+    #[test]
+    fn korean_recall_finds_particles_and_inside_compounds() {
+        let store = store();
+        put(
+            &store,
+            "incident",
+            "notes",
+            "사건은 2023년에 발생했습니다",
+            None,
+        );
+        put(&store, "edit", "notes", "업무수정에 실패했습니다", None);
+        put(&store, "unrelated", "notes", "배포와 관계없는 문장", None);
+
+        for text in ["사건", "사건을", "발생"] {
+            let hits = store
+                .search_ranked(&query(text, None, 10, 20), &all)
+                .unwrap();
+            assert!(
+                ids(&hits).contains(&"incident"),
+                "query={text:?}, hits={:?}",
+                ids(&hits)
+            );
+        }
+        let hits = store
+            .search_ranked(&query("수정", None, 10, 20), &all)
+            .unwrap();
+        let hit = hits.iter().find(|h| h.memory.id == "edit").unwrap();
+        // "수정" occurs inside the unicode61 token "업무수정에"; it was
+        // reached through the substring path, not measured by BM25.
+        assert_eq!(hit.fts_rank, None);
+        assert_eq!(hit.raw.bm25, None);
+        assert!(!ids(&hits).contains(&"unrelated"));
+    }
+
+    #[cfg(feature = "korean")]
+    #[test]
+    fn korean_recall_matches_composed_and_decomposed_hangul() {
+        use unicode_normalization::UnicodeNormalization;
+
+        let store = store();
+        let decomposed: String = "사건은 기록되었습니다".nfd().collect();
+        put(&store, "nfc", "notes", "사건을 기록했습니다", None);
+        put(&store, "nfd", "notes", &decomposed, None);
+        for text in ["사건".to_owned(), "사건을".nfd().collect()] {
+            let hits = store
+                .search_ranked(&query(&text, None, 10, 20), &all)
+                .unwrap();
+            assert!(ids(&hits).contains(&"nfc"), "{text:?}: {:?}", ids(&hits));
+            assert!(ids(&hits).contains(&"nfd"), "{text:?}: {:?}", ids(&hits));
+        }
+    }
+
+    #[cfg(feature = "korean")]
+    #[test]
+    fn korean_substring_candidates_widen_after_filtering() {
+        let store = store();
+        for i in 0..30 {
+            put(
+                &store,
+                &format!("noise-{i:02}"),
+                "other",
+                "업무수정에 실패했습니다",
+                None,
+            );
+        }
+        put(&store, "wanted", "project", "업무수정에 실패했습니다", None);
+        let keep = |memory: &Memory| memory.topic == "project";
+        let hits = store
+            .search_ranked(&query("수정", None, 1, 20), &keep)
+            .unwrap();
+        assert_eq!(ids(&hits), vec!["wanted"]);
+    }
+
+    #[cfg(feature = "korean")]
+    #[test]
+    fn korean_substring_remains_visible_when_other_fts_terms_match() {
+        let store = store();
+        put(&store, "incident", "notes", "업무수정에 실패했습니다", None);
+        for i in 0..30 {
+            put(&store, &format!("noise-{i:02}"), "notes", "배포 일정", None);
+        }
+        let hits = store
+            .search_ranked(&query("배포 수정", None, 5, 20), &all)
+            .unwrap();
+        assert!(ids(&hits).contains(&"incident"), "{:?}", ids(&hits));
     }
 
     /// 150 memories that all match "alpha", each with its own embedding.

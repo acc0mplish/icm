@@ -9318,6 +9318,8 @@ fn cmd_config(cli_db: Option<PathBuf>, cfg: &config::Config) -> Result<()> {
     println!("[recall]");
     println!("  enabled = {}", cfg.recall.enabled);
     println!("  limit = {}", cfg.recall.limit);
+    #[cfg(feature = "korean")]
+    println!("  korean query analysis = compiled in (SQLite v2)");
     if !cfg.recall.server_url.is_empty() {
         println!("  server_url = {}", cfg.recall.server_url);
         println!("  server_limit = {}", cfg.recall.server_limit);

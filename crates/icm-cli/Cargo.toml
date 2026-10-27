@@ -38,6 +38,7 @@ tui = ["dep:ratatui", "dep:crossterm"]
 # are network-accessible so several `icm` processes / Kubernetes replicas
 # share one memory store. The active one is selected at runtime, not here.
 backend-sqlite = ["icm-store/backend-sqlite", "icm-mcp/backend-sqlite"]
+korean = ["backend-sqlite", "icm-store/korean", "icm-mcp/korean"]
 postgres = ["icm-store/postgres", "icm-mcp/postgres"]
 opensearch = ["icm-store/opensearch", "icm-mcp/opensearch"]
 # Persistent local HTTP server (`icm serve --http`) reusing the warm
